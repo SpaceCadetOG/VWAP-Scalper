@@ -98,3 +98,23 @@ Today VWAP vs yesterday VWAP alignment as balance-state detector; trade reaction
 ## Notes
 - This master file is intended as a canonical map for system implementation.
 - If you want, next step is a full machine-readable spec (YAML/JSON) with each chapter's exact triggers, filters, stops, exits, and timeout rules.
+
+## Implementation Checklist / Roadmap
+
+Execution order for this chapter system:
+
+- [x] Step 1: Go module + baseline runtime layout
+- [ ] Step 2: Canonical models
+- [ ] Step 3: Symbol metadata + tick/lot validators
+- [ ] Step 4: Nonce/signing services
+- [ ] Step 5: Market data adapters
+- [ ] Step 6: Trading adapters
+- [ ] Step 7: Account stream adapters
+- [ ] Step 8: Router
+- [ ] Step 9: Global risk engine
+- [ ] Step 10: Replay/paper engine
+- [ ] Step 11: Testnet acceptance tests
+
+Policy lock:
+- Testnet validates API contracts, not live realism.
+- Live-feed paper execution is mandatory before any live order enablement.

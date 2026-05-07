@@ -246,3 +246,25 @@ Replay files:
 
 ---
 This spec is the canonical adapter contract for implementing multi-venue VWAP execution across Hyperliquid, Aster, and Lighter.
+
+## 13) Build Checklist / Roadmap Status
+
+Project: `VWAP_Scalper` (3-venue perps execution foundation)
+
+- [x] Step 1: Go module + baseline runtime layout initialized
+- [ ] Step 2: Canonical models
+- [ ] Step 3: Symbol metadata + tick/lot validators
+- [ ] Step 4: Nonce/signing services
+- [ ] Step 5: Market data adapters
+- [ ] Step 6: Trading adapters
+- [ ] Step 7: Account stream adapters
+- [ ] Step 8: Router
+- [ ] Step 9: Global risk engine
+- [ ] Step 10: Replay/paper engine
+- [ ] Step 11: Testnet acceptance tests
+
+Current Step 1 deliverables:
+- `go.mod` initialized (`github.com/SpaceCadetOG/VWAP-Scalper`)
+- baseline directories created (`cmd`, `internal`, `configs`, `tests`)
+- bootstrap entrypoint added at `cmd/live/main.go`
+- runtime config example added at `configs/live.env.example`
