@@ -511,8 +511,15 @@ func (c *Client) GetAccountSummaryRaw() (map[string]any, error) {
 }
 
 func (c *Client) signedGETHMAC(path string, vals url.Values) ([]byte, error) {
+	return c.signedHMACRequest(http.MethodGet, path, vals)
+}
+
+func (c *Client) signedHMACRequest(method, path string, vals url.Values) ([]byte, error) {
 	if vals == nil {
 		vals = url.Values{}
+	}
+	if c.apiKey == "" || c.apiSecret == "" {
+		return nil, fmt.Errorf("aster hmac auth requires api key and secret")
 	}
 	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	vals.Set("timestamp", ts)
@@ -525,11 +532,58 @@ func (c *Client) signedGETHMAC(path string, vals url.Values) ([]byte, error) {
 	_, _ = mac.Write([]byte(qs))
 	sig := hex.EncodeToString(mac.Sum(nil))
 	payload := qs + "&signature=" + sig
-	u := c.baseURL + path + "?" + payload
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	u := c.baseURL + path
+	var req *http.Request
+	var err error
+	if method == http.MethodGet || method == http.MethodDelete {
+		u += "?" + payload
+		req, err = http.NewRequest(method, u, nil)
+	} else {
+		req, err = http.NewRequest(method, u, strings.NewReader(payload))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("X-MBX-APIKEY", c.apiKey)
-	return c.do(req, http.MethodGet, path)
+	return c.do(req, method, path)
+}
+
+func (c *Client) StartUserDataStream() (string, error) {
+	// Futures v3 USER_STREAM uses signer+signature auth in Pro API mode.
+	b, err := c.signedPOST("/fapi/v3/listenKey", url.Values{})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		ListenKey string `json:"listenKey"`
+	}
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return "", err
+	}
+	lk := strings.TrimSpace(out.ListenKey)
+	if lk == "" {
+		return "", fmt.Errorf("listenKey missing from response")
+	}
+	return lk, nil
+}
+
+func (c *Client) KeepaliveUserDataStream(listenKey string) error {
+	vals := url.Values{}
+	if strings.TrimSpace(listenKey) != "" {
+		vals.Set("listenKey", strings.TrimSpace(listenKey))
+	}
+	_, err := c.signedRequest(http.MethodPut, "/fapi/v3/listenKey", vals)
+	return err
+}
+
+func (c *Client) CloseUserDataStream(listenKey string) error {
+	vals := url.Values{}
+	if strings.TrimSpace(listenKey) != "" {
+		vals.Set("listenKey", strings.TrimSpace(listenKey))
+	}
+	_, err := c.signedRequest(http.MethodDelete, "/fapi/v3/listenKey", vals)
+	return err
 }

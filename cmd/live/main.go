@@ -13,6 +13,7 @@ import (
 	"time"
 
 	aster "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/aster"
+	accountstream "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/accountstream"
 	coinbase "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/coinbase"
 	hyperliquid "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/hyperliquid"
 	lighter "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/lighter"
@@ -27,6 +28,7 @@ import (
 func main() {
 	checkBalances := flag.Bool("check-balances", false, "run venue balance connectivity checks")
 	checkWS := flag.Bool("check-ws", false, "run websocket connectivity checks (WS-first health)")
+	checkAccountStreams := flag.Bool("check-account-streams", false, "run account stream readiness/connectivity checks (Step 7)")
 	testTrade := flag.Bool("test-trade", false, "place a small live test trade and collect order/fill details")
 	testOrderTypes := flag.Bool("test-order-types", false, "place/cancel small Aster order-type smoke tests")
 	testBatch := flag.Bool("test-batch", false, "run live batch-order smoke tests")
@@ -52,6 +54,10 @@ func main() {
 
 	if *checkWS {
 		runWSChecks(strings.ToLower(strings.TrimSpace(*venue)))
+		return
+	}
+	if *checkAccountStreams {
+		runAccountStreamChecks(strings.ToLower(strings.TrimSpace(*venue)))
 		return
 	}
 
@@ -1860,6 +1866,96 @@ func runWSChecks(venue string) {
 	if okCount != len(results) {
 		os.Exit(1)
 	}
+}
+
+func runAccountStreamChecks(venue string) {
+	results := make([]ws.ConnectivityResult, 0)
+	readiness := make([]accountstream.ReadinessResult, 0)
+	asterSelected := false
+	add := func(v string) {
+		readiness = append(readiness, accountstream.ProbeReadiness(v))
+		results = append(results, accountstream.ProbeConnectivity(v))
+		if v == "aster" {
+			asterSelected = true
+		}
+	}
+	switch venue {
+	case "all":
+		add("hyperliquid")
+		add("aster")
+		add("lighter")
+	case "hyperliquid", "aster", "lighter":
+		add(venue)
+	default:
+		fmt.Printf("unknown venue %q for account-stream check\n", venue)
+		os.Exit(2)
+	}
+
+	readyCount := 0
+	for _, r := range readiness {
+		fmt.Println(r.String())
+		if r.Ready {
+			readyCount++
+		}
+	}
+	okCount := 0
+	for _, r := range results {
+		fmt.Println(ws.FormatConnectivity(r))
+		if r.OK {
+			okCount++
+		}
+	}
+	fmt.Printf("account_stream_summary ready=%d/%d ws_ok=%d/%d\n", readyCount, len(readiness), okCount, len(results))
+	if readyCount != len(readiness) || okCount != len(results) {
+		os.Exit(1)
+	}
+	if asterSelected {
+		if err := runAsterListenKeyLifecycleSmoke(); err != nil {
+			fmt.Printf("aster_listenkey_lifecycle_failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("aster_listenkey_lifecycle_ok")
+	}
+}
+
+func runAsterListenKeyLifecycleSmoke() error {
+	chainID := int64(1666)
+	if raw := strings.TrimSpace(os.Getenv("ASTER_CHAIN_ID")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			chainID = parsed
+		}
+	}
+	signer := strings.TrimSpace(os.Getenv("ASTER_SIGNER"))
+	if signer == "" {
+		signer = strings.TrimSpace(os.Getenv("ASTER_SIGNER_ADDRESS"))
+	}
+	priv := strings.TrimSpace(os.Getenv("ASTER_PRIVATE_KEY"))
+	if priv == "" {
+		priv = strings.TrimSpace(os.Getenv("ASTER_SIGNER_PRIVATE_KEY"))
+	}
+	cli, err := aster.NewClient(aster.Config{
+		BaseURL:    strings.TrimSpace(os.Getenv("ASTER_BASE_URL")),
+		User:       strings.TrimSpace(os.Getenv("ASTER_USER")),
+		Signer:     signer,
+		PrivateKey: priv,
+		ChainID:    chainID,
+		APIKey:     strings.TrimSpace(os.Getenv("ASTER_API_KEY")),
+		APISecret:  strings.TrimSpace(os.Getenv("ASTER_API_SECRET")),
+	})
+	if err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	lk, err := cli.StartUserDataStream()
+	if err != nil {
+		return fmt.Errorf("start_listenkey: %w", err)
+	}
+	if err := cli.KeepaliveUserDataStream(lk); err != nil {
+		return fmt.Errorf("keepalive_listenkey: %w", err)
+	}
+	if err := cli.CloseUserDataStream(lk); err != nil {
+		return fmt.Errorf("close_listenkey: %w", err)
+	}
+	return nil
 }
 
 func runCoinbaseBalanceCheck(exitOnErr bool) {
