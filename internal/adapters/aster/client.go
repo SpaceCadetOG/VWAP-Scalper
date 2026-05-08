@@ -376,6 +376,35 @@ func (c *Client) PlaceOrder(vals url.Values) (map[string]any, error) {
 	return out, nil
 }
 
+func (c *Client) PlaceBatchOrders(orders []url.Values) ([]map[string]any, error) {
+	arr := make([]map[string]string, 0, len(orders))
+	for _, ov := range orders {
+		item := map[string]string{}
+		for k, vv := range ov {
+			if len(vv) == 0 {
+				continue
+			}
+			item[k] = vv[0]
+		}
+		arr = append(arr, item)
+	}
+	raw, err := json.Marshal(arr)
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{}
+	q.Set("batchOrders", string(raw))
+	b, err := c.signedPOST("/fapi/v3/batchOrders", q)
+	if err != nil {
+		return nil, err
+	}
+	var out []map[string]any
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *Client) GetOrder(symbol string, orderID int64) (map[string]any, error) {
 	q := url.Values{}
 	q.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
@@ -410,6 +439,35 @@ func (c *Client) CancelOrder(symbol string, orderID int64) (map[string]any, erro
 	q.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
 	q.Set("orderId", strconv.FormatInt(orderID, 10))
 	b, err := c.signedRequest(http.MethodDelete, "/fapi/v3/order", q)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) CancelAllOpenOrders(symbol string) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
+	b, err := c.signedRequest(http.MethodDelete, "/fapi/v3/allOpenOrders", q)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) ChangeMarginType(symbol, marginType string) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
+	q.Set("marginType", strings.ToUpper(strings.TrimSpace(marginType)))
+	b, err := c.signedPOST("/fapi/v3/marginType", q)
 	if err != nil {
 		return nil, err
 	}

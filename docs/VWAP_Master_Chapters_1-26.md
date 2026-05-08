@@ -80,6 +80,105 @@ Two failed VWAP tests with weaker second participation signal exhaustion/trap re
 ## Chapter 26 - VWAP Multi-Session Equilibrium
 Today VWAP vs yesterday VWAP alignment as balance-state detector; trade reaction/transition, not alignment itself.
 
+## Chapter 27 - Strategy #14: VWAP Order Flow Absorption Scalps
+Core idea: trade control flip after aggressive flow is absorbed near VWAP.
+
+Key conditions:
+- Price near VWAP or first deviation band.
+- Repeated aggressive prints with low displacement.
+- Refreshing bid/ask liquidity (absorption) and tape slowdown.
+- Opposite-color flip candle closes with confirmation volume.
+
+Long bias:
+- Sellers hit bid repeatedly near VWAP.
+- Price holds and seller aggression fades.
+- Green flip candle confirms.
+
+Short bias:
+- Buyers lift ask repeatedly near VWAP.
+- Price fails to advance and buyer aggression fades.
+- Red flip candle confirms.
+
+Entry/exit:
+- Enter only after final absorption print plus flip close.
+- Stop beyond absorption zone (ATR/bps/tick-adjusted).
+- Target micro liquidity pocket or VWAP deviation.
+- Expected hold window: 1-3 minutes.
+
+Invalidators:
+- Decisive VWAP break against setup.
+- No flip candle.
+- Aggression continues in original direction.
+- Spread blowout or stale confirmation.
+
+Bot translation:
+- `STATE_ABSORPTION`
+- Requires normalized trades plus BBO/depth (not OHLCV-only).
+
+## Chapter 28 - Strategy #15: VWAP Hybrid Confluence (Delta + Profile + Anchored VWAP)
+Core idea: only trade when session VWAP, anchored VWAP, profile node, and delta/tape all agree.
+
+Confluence stack:
+- Session VWAP (current fair value)
+- Anchored VWAP (event memory)
+- Volume profile node (HVN/LVN/POC)
+- Delta flip and absorption/tape defense
+- Confirmation candle close
+
+Zone rule:
+- VWAP + anchored VWAP + profile node must cluster tightly.
+- Use ATR/bps adaptive threshold (no fixed stock-cents assumption for crypto).
+
+Long/short:
+- Long: hold at confluence + negative-to-positive delta flip + green close.
+- Short: rejection/failure at confluence + positive-to-negative delta flip + red close.
+
+Risk/management:
+- Stop beyond confluence cluster (ATR/bps/tick-adjusted).
+- Target 1.5R-2.5R and nearby liquidity pocket/deviation/profile level.
+- Majority take near 1.5R; small runner only with supportive delta + expanding post-entry volume.
+- Typical duration 1-3 minutes.
+
+Re-entry:
+- Maximum one re-entry per direction, only after reclaimed zone and fresh delta flip.
+
+Bot translation:
+- `STATE_HYBRID_CONFLUENCE`
+- Confidence scoring:
+  - +20 session VWAP proximity
+  - +20 anchored VWAP alignment
+  - +20 profile confluence
+  - +20 delta flip
+  - +10 absorption
+  - +10 confirmation candle
+- Thresholds:
+  - Paper: 70+
+  - Live restricted: 80+
+  - Live full: 85+
+
+## Final Chapter - Operator Mindset / Trading Doctrine
+This is operating doctrine, not a new setup state.
+
+Principles:
+- Trade structure, not emotion.
+- Confirmation beats prediction.
+- Small losses preserve survival.
+- Journaling converts outcomes into rules.
+- Consistency outranks one-off wins.
+
+System rules:
+- No setup state -> no trade.
+- No invalidation -> no trade.
+- No risk budget -> no trade.
+- No TTL -> no trade.
+- No fresh confirmation -> no re-entry.
+- Log every entry/exit/reject/force-close.
+
+Deployment doctrine:
+- Backtest and paper-test before live allowlist.
+- Expand live only after stable metrics.
+- Operator overrides must be data-justified, never emotional.
+
 ---
 
 ## Unified Strategy Families (Implementation Grouping)
@@ -98,6 +197,12 @@ Today VWAP vs yesterday VWAP alignment as balance-state detector; trade reaction
 ## Notes
 - This master file is intended as a canonical map for system implementation.
 - If you want, next step is a full machine-readable spec (YAML/JSON) with each chapter's exact triggers, filters, stops, exits, and timeout rules.
+
+## Progress Update
+- Chapters captured: 1-28 complete
+- Strategies captured: 15/15 complete
+- Remaining strategy capture: none
+- Premium live filter candidate: Chapter 28 (highest selectivity / highest confirmation burden)
 
 ## Implementation Checklist / Roadmap
 
