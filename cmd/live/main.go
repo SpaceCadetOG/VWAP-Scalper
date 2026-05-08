@@ -50,7 +50,8 @@ func runCoinbaseBalanceCheck(exitOnErr bool) {
 	if !strings.EqualFold(strings.TrimSpace(os.Getenv("COINBASE_SPOT_ONLY")), "true") {
 		fmt.Println("warning: COINBASE_SPOT_ONLY not set to true")
 	}
-	cli := coinbase.NewClient(strings.TrimSpace(os.Getenv("COINBASE_BASE_URL")))
+	baseURL := strings.TrimSpace(os.Getenv("COINBASE_BASE_URL"))
+	cli := coinbase.NewClient(baseURL)
 	timePayload, err := cli.Time()
 	if err != nil {
 		fmt.Printf("COINBASE connectivity failed: %v\n", err)
@@ -68,7 +69,67 @@ func runCoinbaseBalanceCheck(exitOnErr bool) {
 		fmt.Println("spot_balance=not_checked (missing COINBASE_API_KEY/SECRET/PASSPHRASE)")
 		return
 	}
-	fmt.Println("spot_balance=auth_config_present (authenticated balance check wiring is next)")
+
+	authCli := coinbase.NewClientWithAuth(baseURL, key, sec, pass)
+	accounts, err := authCli.ListAccounts()
+	if err != nil {
+		fmt.Printf("spot_balance_error=%v\n", err)
+		if exitOnErr {
+			os.Exit(1)
+		}
+		return
+	}
+
+	priceCache := map[string]float64{
+		"USD":  1.0,
+		"USDC": 1.0,
+		"USDT": 1.0,
+	}
+	getUSDPrice := func(cur string) (float64, bool) {
+		cur = strings.ToUpper(strings.TrimSpace(cur))
+		if p, ok := priceCache[cur]; ok {
+			return p, true
+		}
+		pairs := []string{cur + "-USD", cur + "-USDC", cur + "-USDT"}
+		for _, p := range pairs {
+			px, err := authCli.ProductTicker(p)
+			if err == nil && px > 0 {
+				priceCache[cur] = px
+				return px, true
+			}
+		}
+		return 0, false
+	}
+
+	type row struct {
+		currency string
+		balance  string
+		avail    string
+		estUSD   float64
+	}
+	rows := make([]row, 0)
+	unpriced := 0
+	for _, a := range accounts {
+		rat, ok := new(big.Rat).SetString(strings.TrimSpace(a.Balance))
+		if !ok || rat.Sign() == 0 {
+			continue
+		}
+		f, _ := rat.Float64()
+		price, ok := getUSDPrice(a.Currency)
+		if !ok {
+			unpriced++
+			continue
+		}
+		est := f * price
+		if est >= 0.01 {
+			rows = append(rows, row{currency: a.Currency, balance: a.Balance, avail: a.Available, estUSD: est})
+		}
+	}
+
+	fmt.Printf("spot_accounts=%d tokens_ge_0.01_usd=%d unpriced_nonzero=%d\n", len(accounts), len(rows), unpriced)
+	for _, r := range rows {
+		fmt.Printf("%s balance=%s available=%s est_usd=%.6f\n", r.currency, r.balance, r.avail, r.estUSD)
+	}
 }
 
 func runHyperliquidBalanceCheck(exitOnErr bool) {

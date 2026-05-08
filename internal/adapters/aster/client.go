@@ -13,9 +13,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/signing"
 	gethmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
@@ -54,9 +54,7 @@ type Client struct {
 	apiKey     string
 	apiSecret  string
 	client     *http.Client
-
-	nonceMu   sync.Mutex
-	lastNonce int64
+	nonce     *signing.NonceManager
 }
 
 func NewClient(cfg Config) (*Client, error) {
@@ -75,6 +73,7 @@ func NewClient(cfg Config) (*Client, error) {
 		apiKey:     strings.TrimSpace(cfg.APIKey),
 		apiSecret:  strings.TrimSpace(cfg.APISecret),
 		client:     &http.Client{Timeout: 12 * time.Second},
+		nonce:      signing.NewMicrosNonceManager(),
 	}
 
 	if c.chainID <= 0 {
@@ -103,14 +102,7 @@ func (c *Client) validateSignerMatchesPrivateKey() error {
 }
 
 func (c *Client) nextNonceUS() int64 {
-	n := time.Now().UnixMicro()
-	c.nonceMu.Lock()
-	defer c.nonceMu.Unlock()
-	if n <= c.lastNonce {
-		n = c.lastNonce + 1
-	}
-	c.lastNonce = n
-	return n
+	return c.nonce.Next(strings.ToLower(c.signer))
 }
 
 func (c *Client) signedGET(path string, vals url.Values) ([]byte, error) {
