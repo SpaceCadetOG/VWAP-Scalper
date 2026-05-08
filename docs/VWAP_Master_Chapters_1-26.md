@@ -105,7 +105,7 @@ Execution order for this chapter system:
 
 - [x] Step 1: Go module + baseline runtime layout
 - [ ] Step 2: Canonical models
-- [ ] Step 3: Symbol metadata + tick/lot validators
+- [x] Step 3: Symbol metadata + tick/lot validators
 - [ ] Step 4: Nonce/signing services
 - [ ] Step 5: Market data adapters
 - [ ] Step 6: Trading adapters

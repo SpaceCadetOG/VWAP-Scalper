@@ -253,7 +253,7 @@ Project: `VWAP_Scalper` (3-venue perps execution foundation)
 
 - [x] Step 1: Go module + baseline runtime layout initialized
 - [ ] Step 2: Canonical models
-- [ ] Step 3: Symbol metadata + tick/lot validators
+- [x] Step 3: Symbol metadata + tick/lot validators
 - [ ] Step 4: Nonce/signing services
 - [ ] Step 5: Market data adapters
 - [ ] Step 6: Trading adapters
