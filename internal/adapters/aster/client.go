@@ -106,6 +106,14 @@ func (c *Client) nextNonceUS() int64 {
 }
 
 func (c *Client) signedGET(path string, vals url.Values) ([]byte, error) {
+	return c.signedRequest(http.MethodGet, path, vals)
+}
+
+func (c *Client) signedPOST(path string, vals url.Values) ([]byte, error) {
+	return c.signedRequest(http.MethodPost, path, vals)
+}
+
+func (c *Client) signedRequest(method, path string, vals url.Values) ([]byte, error) {
 	if vals == nil {
 		vals = url.Values{}
 	}
@@ -115,12 +123,21 @@ func (c *Client) signedGET(path string, vals url.Values) ([]byte, error) {
 		return nil, err
 	}
 
-	u := c.baseURL + path + "?" + payload
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	u := c.baseURL + path
+	var req *http.Request
+	if method == http.MethodGet || method == http.MethodDelete {
+		u += "?" + payload
+		req, err = http.NewRequest(method, u, nil)
+	} else {
+		req, err = http.NewRequest(method, u, strings.NewReader(payload))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	b, err := c.do(req, http.MethodGet, path)
+	b, err := c.do(req, method, path)
 	if err == nil {
 		return b, nil
 	}
@@ -134,12 +151,20 @@ func (c *Client) signedGET(path string, vals url.Values) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	u = c.baseURL + path + "?" + payload
-	req, err = http.NewRequest(http.MethodGet, u, nil)
+	u = c.baseURL + path
+	if method == http.MethodGet || method == http.MethodDelete {
+		u += "?" + payload
+		req, err = http.NewRequest(method, u, nil)
+	} else {
+		req, err = http.NewRequest(method, u, strings.NewReader(payload))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	return c.do(req, http.MethodGet, path)
+	return c.do(req, method, path)
 }
 
 func (c *Client) signAndEncodeAgent(vals url.Values, legacyV bool) (string, error) {
@@ -337,6 +362,82 @@ func (c *Client) GetBalanceRaw() ([]map[string]any, error) {
 		return nil, err
 	}
 	return rows, nil
+}
+
+func (c *Client) PlaceOrder(vals url.Values) (map[string]any, error) {
+	b, err := c.signedPOST("/fapi/v3/order", vals)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) GetOrder(symbol string, orderID int64) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
+	q.Set("orderId", strconv.FormatInt(orderID, 10))
+	b, err := c.signedGET("/fapi/v3/order", q)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) PositionRisk(symbol string) ([]map[string]any, error) {
+	q := url.Values{}
+	q.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
+	b, err := c.signedGET("/fapi/v3/positionRisk", q)
+	if err != nil {
+		return nil, err
+	}
+	var out []map[string]any
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) CancelOrder(symbol string, orderID int64) (map[string]any, error) {
+	q := url.Values{}
+	q.Set("symbol", strings.ToUpper(strings.TrimSpace(symbol)))
+	q.Set("orderId", strconv.FormatInt(orderID, 10))
+	b, err := c.signedRequest(http.MethodDelete, "/fapi/v3/order", q)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) MarkPrice(symbol string) (float64, error) {
+	u := c.baseURL + "/fapi/v1/ticker/price?symbol=" + strings.ToUpper(strings.TrimSpace(symbol))
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	b, err := c.do(req, http.MethodGet, "/fapi/v1/ticker/price")
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		Price string `json:"price"`
+	}
+	if err := decodeJSONNumbers(b, &out); err != nil {
+		return 0, err
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(out.Price), 64)
+	if err != nil {
+		return 0, err
+	}
+	return f, nil
 }
 
 func (c *Client) GetAccountSummaryRaw() (map[string]any, error) {

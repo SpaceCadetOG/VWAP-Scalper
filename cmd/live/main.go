@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"math/big"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -18,8 +19,16 @@ import (
 func main() {
 	checkBalances := flag.Bool("check-balances", false, "run venue balance connectivity checks")
 	checkWS := flag.Bool("check-ws", false, "run websocket connectivity checks (WS-first health)")
+	testTrade := flag.Bool("test-trade", false, "place a small live test trade and collect order/fill details")
 	venue := flag.String("venue", "all", "venue to check (all|aster|hyperliquid|lighter|coinbase)")
+	symbol := flag.String("symbol", "ETHUSDT", "trade symbol for --test-trade")
+	notionalUSD := flag.Float64("notional-usd", 5.0, "target notional USD for --test-trade")
 	flag.Parse()
+
+	if *testTrade {
+		runTestTrade(strings.ToLower(strings.TrimSpace(*venue)), strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
+		return
+	}
 
 	if *checkWS {
 		runWSChecks(strings.ToLower(strings.TrimSpace(*venue)))
@@ -49,6 +58,184 @@ func main() {
 	default:
 		fmt.Printf("unknown venue %q\n", *venue)
 		os.Exit(2)
+	}
+}
+
+func runTestTrade(venue, symbol string, notionalUSD float64) {
+	switch venue {
+	case "aster":
+		runAsterTestTrade(symbol, notionalUSD)
+	default:
+		fmt.Printf("test-trade currently implemented for venue=aster only; requested=%s\n", venue)
+		os.Exit(2)
+	}
+}
+
+func runAsterTestTrade(symbol string, notionalUSD float64) {
+	fmt.Println("=== ASTER TEST TRADE ===")
+	chainID := int64(1666)
+	if raw := strings.TrimSpace(os.Getenv("ASTER_CHAIN_ID")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			chainID = parsed
+		}
+	}
+	signer := strings.TrimSpace(os.Getenv("ASTER_SIGNER"))
+	if signer == "" {
+		signer = strings.TrimSpace(os.Getenv("ASTER_SIGNER_ADDRESS"))
+	}
+	priv := strings.TrimSpace(os.Getenv("ASTER_PRIVATE_KEY"))
+	if priv == "" {
+		priv = strings.TrimSpace(os.Getenv("ASTER_SIGNER_PRIVATE_KEY"))
+	}
+	cli, err := aster.NewClient(aster.Config{
+		BaseURL:    strings.TrimSpace(os.Getenv("ASTER_BASE_URL")),
+		User:       strings.TrimSpace(os.Getenv("ASTER_USER")),
+		Signer:     signer,
+		PrivateKey: priv,
+		ChainID:    chainID,
+	})
+	if err != nil {
+		fmt.Printf("ASTER init failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	price, err := cli.MarkPrice(symbol)
+	if err != nil {
+		fmt.Printf("mark price failed: %v\n", err)
+		os.Exit(1)
+	}
+	if price <= 0 {
+		fmt.Println("invalid mark price")
+		os.Exit(1)
+	}
+	rawQty := notionalUSD / price
+	// conservative precision for test path; exchange will enforce final precision constraints.
+	qty := fmt.Sprintf("%.4f", rawQty)
+	fmt.Printf("symbol=%s mark_price=%.6f target_notional=%.2f qty=%s\n", symbol, price, notionalUSD, qty)
+
+	openVals := map[string]string{
+		"symbol":           symbol,
+		"side":             "BUY",
+		"type":             "MARKET",
+		"positionSide":     "BOTH",
+		"quantity":         qty,
+		"newOrderRespType": "RESULT",
+	}
+	openQ := makeURLValues(openVals)
+	openResp, err := cli.PlaceOrder(openQ)
+	if err != nil {
+		fmt.Printf("open order failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("open_order_resp=%v\n", openResp)
+
+	orderID := int64FromAny(openResp["orderId"])
+	executedQty := strings.TrimSpace(fmt.Sprint(openResp["executedQty"]))
+	if executedQty == "" || executedQty == "0" || executedQty == "0.0" {
+		fmt.Println("open executedQty is zero; stopping test flow")
+		os.Exit(1)
+	}
+
+	if orderID > 0 {
+		detail, err := cli.GetOrder(symbol, orderID)
+		if err == nil {
+			fmt.Printf("open_order_detail=%v\n", detail)
+		} else {
+			fmt.Printf("open_order_detail_error=%v\n", err)
+		}
+	}
+
+	posBeforeClose, _ := cli.PositionRisk(symbol)
+	fmt.Printf("position_risk_after_open=%v\n", posBeforeClose)
+
+	closeVals := map[string]string{
+		"symbol":           symbol,
+		"side":             "SELL",
+		"type":             "MARKET",
+		"positionSide":     "BOTH",
+		"reduceOnly":       "true",
+		"quantity":         executedQty,
+		"newOrderRespType": "RESULT",
+	}
+	closeResp, err := cli.PlaceOrder(makeURLValues(closeVals))
+	if err != nil {
+		fmt.Printf("close order failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("close_order_resp=%v\n", closeResp)
+
+	closeOrderID := int64FromAny(closeResp["orderId"])
+	if closeOrderID > 0 {
+		detail, err := cli.GetOrder(symbol, closeOrderID)
+		if err == nil {
+			fmt.Printf("close_order_detail=%v\n", detail)
+		} else {
+			fmt.Printf("close_order_detail_error=%v\n", err)
+		}
+	}
+
+	posAfterClose, _ := cli.PositionRisk(symbol)
+	fmt.Printf("position_risk_after_close=%v\n", posAfterClose)
+
+	// Cancel-order test: create a far-away LIMIT order then cancel it.
+	limitPrice := price * 0.5
+	limitVals := map[string]string{
+		"symbol":           symbol,
+		"side":             "BUY",
+		"type":             "LIMIT",
+		"timeInForce":      "GTC",
+		"positionSide":     "BOTH",
+		"quantity":         qty,
+		"price":            fmt.Sprintf("%.2f", limitPrice),
+		"newOrderRespType": "RESULT",
+	}
+	limitResp, err := cli.PlaceOrder(makeURLValues(limitVals))
+	if err != nil {
+		fmt.Printf("limit order (cancel test) failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("limit_order_resp=%v\n", limitResp)
+	limitOrderID := int64FromAny(limitResp["orderId"])
+	if limitOrderID > 0 {
+		cancelResp, err := cli.CancelOrder(symbol, limitOrderID)
+		if err != nil {
+			fmt.Printf("cancel_order_error=%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("cancel_order_resp=%v\n", cancelResp)
+		cancelDetail, err := cli.GetOrder(symbol, limitOrderID)
+		if err != nil {
+			fmt.Printf("cancel_order_detail_error=%v\n", err)
+		} else {
+			fmt.Printf("cancel_order_detail=%v\n", cancelDetail)
+		}
+	}
+	fmt.Println("ASTER test trade complete")
+}
+
+func makeURLValues(m map[string]string) url.Values {
+	v := url.Values{}
+	for k, val := range m {
+		v.Set(k, val)
+	}
+	return v
+}
+
+func int64FromAny(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case float64:
+		return int64(x)
+	case string:
+		n, _ := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+		return n
+	default:
+		s := strings.TrimSpace(fmt.Sprint(v))
+		n, _ := strconv.ParseInt(s, 10, 64)
+		return n
 	}
 }
 
