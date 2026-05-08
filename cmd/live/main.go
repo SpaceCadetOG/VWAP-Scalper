@@ -9,13 +9,14 @@ import (
 	"strings"
 
 	aster "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/aster"
+	coinbase "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/coinbase"
 	hyperliquid "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/hyperliquid"
 	lighter "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/lighter"
 )
 
 func main() {
 	checkBalances := flag.Bool("check-balances", false, "run venue balance connectivity checks")
-	venue := flag.String("venue", "all", "venue to check (all|aster|hyperliquid|lighter)")
+	venue := flag.String("venue", "all", "venue to check (all|aster|hyperliquid|lighter|coinbase)")
 	flag.Parse()
 
 	if !*checkBalances {
@@ -29,16 +30,45 @@ func main() {
 		runHyperliquidBalanceCheck(false)
 		runAsterBalanceCheck(false)
 		runLighterBalanceCheck(false)
+		runCoinbaseBalanceCheck(false)
 	case "hyperliquid":
 		runHyperliquidBalanceCheck(true)
 	case "aster":
 		runAsterBalanceCheck(true)
 	case "lighter":
 		runLighterBalanceCheck(true)
+	case "coinbase":
+		runCoinbaseBalanceCheck(true)
 	default:
 		fmt.Printf("unknown venue %q\n", *venue)
 		os.Exit(2)
 	}
+}
+
+func runCoinbaseBalanceCheck(exitOnErr bool) {
+	fmt.Println("=== COINBASE (SPOT ONLY) ===")
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("COINBASE_SPOT_ONLY")), "true") {
+		fmt.Println("warning: COINBASE_SPOT_ONLY not set to true")
+	}
+	cli := coinbase.NewClient(strings.TrimSpace(os.Getenv("COINBASE_BASE_URL")))
+	timePayload, err := cli.Time()
+	if err != nil {
+		fmt.Printf("COINBASE connectivity failed: %v\n", err)
+		if exitOnErr {
+			os.Exit(1)
+		}
+		return
+	}
+	fmt.Printf("connectivity_ok time=%s\n", strings.TrimSpace(timePayload))
+
+	key := strings.TrimSpace(os.Getenv("COINBASE_API_KEY"))
+	sec := strings.TrimSpace(os.Getenv("COINBASE_API_SECRET"))
+	pass := strings.TrimSpace(os.Getenv("COINBASE_API_PASSPHRASE"))
+	if key == "" || sec == "" || pass == "" {
+		fmt.Println("spot_balance=not_checked (missing COINBASE_API_KEY/SECRET/PASSPHRASE)")
+		return
+	}
+	fmt.Println("spot_balance=auth_config_present (authenticated balance check wiring is next)")
 }
 
 func runHyperliquidBalanceCheck(exitOnErr bool) {
@@ -59,7 +89,32 @@ func runHyperliquidBalanceCheck(exitOnErr bool) {
 	ms, _ := state["marginSummary"].(map[string]any)
 	cs, _ := state["crossMarginSummary"].(map[string]any)
 	positions, _ := state["assetPositions"].([]any)
-	fmt.Printf("account_value=%v total_ntl_pos=%v total_raw_usd=%v positions=%d\n", ms["accountValue"], ms["totalNtlPos"], cs["totalRawUsd"], len(positions))
+	fmt.Printf("perp account_value=%v total_ntl_pos=%v total_raw_usd=%v positions=%d\n", ms["accountValue"], ms["totalNtlPos"], cs["totalRawUsd"], len(positions))
+
+	spot, err := cli.SpotClearinghouseState(addr)
+	if err != nil {
+		fmt.Printf("spot_state_error=%v\n", err)
+		if exitOnErr {
+			os.Exit(1)
+		}
+		return
+	}
+	bals, _ := spot["balances"].([]any)
+	nonZero := 0
+	for _, row := range bals {
+		m, ok := row.(map[string]any)
+		if !ok {
+			continue
+		}
+		coin := fmt.Sprint(m["coin"])
+		total := strings.TrimSpace(fmt.Sprint(m["total"]))
+		hold := strings.TrimSpace(fmt.Sprint(m["hold"]))
+		if rat, ok := new(big.Rat).SetString(total); ok && rat.Sign() != 0 {
+			nonZero++
+			fmt.Printf("spot %s total=%s hold=%s\n", coin, total, hold)
+		}
+	}
+	fmt.Printf("spot balances=%d nonzero=%d\n", len(bals), nonZero)
 }
 
 func runAsterBalanceCheck(exitOnErr bool) {
@@ -115,13 +170,40 @@ func runAsterBalanceCheck(exitOnErr bool) {
 	}
 
 	nonZero := 0
+	usdtBal, usdtAvail := "not_found", "not_found"
+	usdcBal, usdcAvail := "not_found", "not_found"
 	for _, r := range bals {
+		asset := fmt.Sprint(r["asset"])
 		bal := fmt.Sprint(r["balance"])
+		avail := fmt.Sprint(r["availableBalance"])
 		if rat, ok := new(big.Rat).SetString(strings.TrimSpace(bal)); ok && rat.Sign() != 0 {
 			nonZero++
 		}
+		if asset == "USDT" {
+			usdtBal, usdtAvail = bal, avail
+		}
+		if asset == "USDC" {
+			usdcBal, usdcAvail = bal, avail
+		}
 	}
-	fmt.Printf("account_keys=%d balances=%d nonzero=%d\n", len(acct), len(bals), nonZero)
+	positions := 0
+	openPositions := 0
+	if p, ok := acct["positions"].([]any); ok {
+		positions = len(p)
+		for _, row := range p {
+			m, ok := row.(map[string]any)
+			if !ok {
+				continue
+			}
+			pos := strings.TrimSpace(fmt.Sprint(m["position"]))
+			if rat, ok := new(big.Rat).SetString(pos); ok && rat.Sign() != 0 {
+				openPositions++
+			}
+		}
+	}
+	fmt.Printf("account_keys=%d balances=%d nonzero=%d positions=%d open_positions=%d\n", len(acct), len(bals), nonZero, positions, openPositions)
+	fmt.Printf("USDT balance=%s available=%s\n", usdtBal, usdtAvail)
+	fmt.Printf("USDC balance=%s available=%s\n", usdcBal, usdcAvail)
 }
 
 func runLighterBalanceCheck(exitOnErr bool) {

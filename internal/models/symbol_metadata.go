@@ -13,6 +13,7 @@ const (
 	VenueHyperliquid Venue = "hyperliquid"
 	VenueAster       Venue = "aster"
 	VenueLighter     Venue = "lighter"
+	VenueCoinbase    Venue = "coinbase"
 )
 
 // SymbolSpec defines tradable market constraints for a venue symbol.

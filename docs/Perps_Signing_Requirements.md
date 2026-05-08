@@ -1,6 +1,8 @@
 # Perps Signing Requirements (Hyperliquid, Aster, Lighter)
 
-This document locks mandatory signing and execution-lifecycle rules for perpetual futures trading across the three venue adapters.
+This document locks mandatory signing and execution-lifecycle rules for perpetual futures trading across the three perps venue adapters.
+
+Note: Coinbase is integrated as spot-only and is out of scope for this perps signing document.
 
 ## 1) Hyperliquid Perps Requirements
 

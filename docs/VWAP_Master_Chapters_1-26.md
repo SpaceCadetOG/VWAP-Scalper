@@ -92,7 +92,7 @@ Today VWAP vs yesterday VWAP alignment as balance-state detector; trade reaction
 1. State Engine: compression/open-drive/news/equilibrium/exhaustion
 2. Shared Risk + Execution Core
 3. Setup Modules (chapter-based)
-4. Venue Router (3 venues)
+4. Venue Router (4 venues; Coinbase spot-only)
 5. Replay + Scoring + Journal
 
 ## Notes
@@ -118,3 +118,7 @@ Execution order for this chapter system:
 Policy lock:
 - Testnet validates API contracts, not live realism.
 - Live-feed paper execution is mandatory before any live order enablement.
+
+## Venue Expansion Note
+- Coinbase is added as a spot-only venue.
+- Perps execution remains on Hyperliquid, Aster, and Lighter.

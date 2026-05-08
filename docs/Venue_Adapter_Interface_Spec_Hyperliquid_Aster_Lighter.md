@@ -3,6 +3,7 @@
 - Hyperliquid
 - Aster
 - Lighter
+- Coinbase (spot-only)
 
 ## 1) Design Goals
 - One strategy core for Chapters 1-26.
@@ -245,7 +246,7 @@ Replay files:
 - `ADAPTER_RECONNECT_BACKOFF_MS=250,500,1000,2000,5000`
 
 ---
-This spec is the canonical adapter contract for implementing multi-venue VWAP execution across Hyperliquid, Aster, and Lighter.
+This spec is the canonical adapter contract for implementing multi-venue VWAP execution across Hyperliquid, Aster, Lighter, and Coinbase (spot-only).
 
 ## 13) Build Checklist / Roadmap Status
 

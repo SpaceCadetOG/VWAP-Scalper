@@ -61,3 +61,15 @@ func (c *Client) ClearinghouseState(user string) (map[string]any, error) {
 	}
 	return out, nil
 }
+
+func (c *Client) SpotClearinghouseState(user string) (map[string]any, error) {
+	b, err := c.info(map[string]any{"type": "spotClearinghouseState", "user": user})
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
