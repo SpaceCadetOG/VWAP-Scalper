@@ -104,7 +104,7 @@ Today VWAP vs yesterday VWAP alignment as balance-state detector; trade reaction
 Execution order for this chapter system:
 
 - [x] Step 1: Go module + baseline runtime layout
-- [ ] Step 2: Canonical models
+- [x] Step 2: Canonical models
 - [x] Step 3: Symbol metadata + tick/lot validators
 - [ ] Step 4: Nonce/signing services
 - [ ] Step 5: Market data adapters

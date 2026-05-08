@@ -252,7 +252,7 @@ This spec is the canonical adapter contract for implementing multi-venue VWAP ex
 Project: `VWAP_Scalper` (3-venue perps execution foundation)
 
 - [x] Step 1: Go module + baseline runtime layout initialized
-- [ ] Step 2: Canonical models
+- [x] Step 2: Canonical models
 - [x] Step 3: Symbol metadata + tick/lot validators
 - [ ] Step 4: Nonce/signing services
 - [ ] Step 5: Market data adapters
