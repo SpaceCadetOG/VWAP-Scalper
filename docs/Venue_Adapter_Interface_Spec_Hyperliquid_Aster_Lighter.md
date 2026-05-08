@@ -256,7 +256,7 @@ Project: `VWAP_Scalper` (3-venue perps execution foundation)
 - [x] Step 2: Canonical models
 - [x] Step 3: Symbol metadata + tick/lot validators
 - [x] Step 4: Nonce/signing services
-- [ ] Step 5: Market data adapters
+- [x] Step 5: Market data adapters
 - [ ] Step 6: Trading adapters
 - [ ] Step 7: Account stream adapters
 - [ ] Step 8: Router

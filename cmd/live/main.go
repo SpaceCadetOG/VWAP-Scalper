@@ -12,12 +12,19 @@ import (
 	coinbase "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/coinbase"
 	hyperliquid "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/hyperliquid"
 	lighter "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/lighter"
+	ws "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/ws"
 )
 
 func main() {
 	checkBalances := flag.Bool("check-balances", false, "run venue balance connectivity checks")
+	checkWS := flag.Bool("check-ws", false, "run websocket connectivity checks (WS-first health)")
 	venue := flag.String("venue", "all", "venue to check (all|aster|hyperliquid|lighter|coinbase)")
 	flag.Parse()
+
+	if *checkWS {
+		runWSChecks(strings.ToLower(strings.TrimSpace(*venue)))
+		return
+	}
 
 	if !*checkBalances {
 		fmt.Println("vwap-multi-venue-bot bootstrap")
@@ -42,6 +49,37 @@ func main() {
 	default:
 		fmt.Printf("unknown venue %q\n", *venue)
 		os.Exit(2)
+	}
+}
+
+func runWSChecks(venue string) {
+	results := make([]ws.ConnectivityResult, 0)
+	add := func(r ws.ConnectivityResult) { results = append(results, r) }
+	switch venue {
+	case "all":
+		add(ws.ProbeConnectivity(hyperliquid.DefaultWSConfig()))
+		add(ws.ProbeConnectivity(aster.DefaultWSConfig()))
+		add(ws.ProbeConnectivity(lighter.DefaultWSConfig()))
+	case "hyperliquid":
+		add(ws.ProbeConnectivity(hyperliquid.DefaultWSConfig()))
+	case "aster":
+		add(ws.ProbeConnectivity(aster.DefaultWSConfig()))
+	case "lighter":
+		add(ws.ProbeConnectivity(lighter.DefaultWSConfig()))
+	default:
+		fmt.Printf("unknown venue %q for ws check\n", venue)
+		os.Exit(2)
+	}
+	okCount := 0
+	for _, r := range results {
+		fmt.Println(ws.FormatConnectivity(r))
+		if r.OK {
+			okCount++
+		}
+	}
+	fmt.Printf("ws_summary ok=%d total=%d\n", okCount, len(results))
+	if okCount != len(results) {
+		os.Exit(1)
 	}
 }
 
