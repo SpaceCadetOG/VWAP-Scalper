@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
+	"net/http"
 	"net/url"
 	"os"
 	"sort"
@@ -52,7 +54,7 @@ func main() {
 	flag.Parse()
 
 	if *start {
-		syms := resolveSymbols(envString("BOT_SYMBOLS", "BTCUSDT"), "BTCUSDT")
+		syms := resolvePaperUniverse(envString("BOT_SYMBOLS", "BTCUSDT"), "BTCUSDT")
 		runPaperDaemon(syms, envFloat("BOT_NOTIONAL_USD", 10))
 		return
 	}
@@ -80,7 +82,11 @@ func main() {
 		return
 	}
 	if *paperDaemon {
-		runPaperDaemon(resolveSymbols(*symbols, *symbol), *notionalUSD)
+		if strings.TrimSpace(*symbols) != "" {
+			runPaperDaemon(resolveSymbols(*symbols, *symbol), *notionalUSD)
+			return
+		}
+		runPaperDaemon(resolvePaperUniverse(*symbols, *symbol), *notionalUSD)
 		return
 	}
 
@@ -173,13 +179,19 @@ func runPaperDaemon(symbols []string, notionalUSD float64) {
 		intervalSec = 5
 	}
 	liveVenue := strings.ToLower(strings.TrimSpace(envString("PAPER_PROMOTE_LIVE_VENUE", "hyperliquid")))
-	targetLev := envInt("BOT_TARGET_LEVERAGE", 10)
+	targetLev := envInt("BOT_TARGET_LEVERAGE", 3)
+	symbols = ensurePaperUniverse(symbols)
 	fmt.Printf("CONFIG symbols=%s notional=%.4f interval_sec=%d mode=paper live_venue=%s target_lev=%dx\n", strings.Join(symbols, ","), notionalUSD, intervalSec, liveVenue, targetLev)
 	fmt.Println("CONFIG controls: promote_next_live='y' + Enter")
 	autoPromote := envBool("PAPER_AUTO_PROMOTE_LIVE", false)
 	if autoPromote {
 		fmt.Println("CONFIG auto_promote_live=true")
 	}
+	refreshSec := envInt("BOT_SYMBOL_REFRESH_SEC", 600)
+	if refreshSec < 60 {
+		refreshSec = 60
+	}
+	nextRefresh := time.Now().Add(time.Duration(refreshSec) * time.Second)
 	var promoteRequested int32
 	go func() {
 		sc := bufio.NewScanner(os.Stdin)
@@ -194,6 +206,14 @@ func runPaperDaemon(symbols []string, notionalUSD float64) {
 	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer ticker.Stop()
 	for {
+		if shouldRefreshPaperUniverse(symbols, nextRefresh) {
+			updated := ensurePaperUniverse(symbols)
+			if strings.Join(updated, ",") != strings.Join(symbols, ",") {
+				fmt.Printf("CONFIG symbols_refreshed=%s\n", strings.Join(updated, ","))
+			}
+			symbols = updated
+			nextRefresh = time.Now().Add(time.Duration(refreshSec) * time.Second)
+		}
 		for _, symbol := range symbols {
 			intent, promoVenues, err := runPaperE2EOnce(symbol, notionalUSD)
 			if err != nil {
@@ -208,6 +228,254 @@ func runPaperDaemon(symbols []string, notionalUSD float64) {
 		}
 		<-ticker.C
 	}
+}
+
+type paperUniverseConfig struct {
+	Mode         string
+	MaxSymbols   int
+	RefreshSec   int
+	FallbackRaw  string
+	FallbackSeed string
+}
+
+func loadPaperUniverseConfig(fallbackRaw, fallbackSeed string) paperUniverseConfig {
+	mode := strings.ToLower(strings.TrimSpace(envString("BOT_SYMBOL_SOURCE_MODE", "dynamic")))
+	if mode == "" {
+		mode = "dynamic"
+	}
+	return paperUniverseConfig{
+		Mode:         mode,
+		MaxSymbols:   envInt("BOT_SYMBOLS_MAX", 25),
+		RefreshSec:   envInt("BOT_SYMBOL_REFRESH_SEC", 600),
+		FallbackRaw:  fallbackRaw,
+		FallbackSeed: fallbackSeed,
+	}
+}
+
+func resolvePaperUniverse(fallbackRaw, fallbackSeed string) []string {
+	cfg := loadPaperUniverseConfig(fallbackRaw, fallbackSeed)
+	if cfg.Mode == "static" {
+		return resolveSymbols(cfg.FallbackRaw, cfg.FallbackSeed)
+	}
+	symbols, err := discoverPaperSymbols(cfg)
+	if err != nil {
+		fallback := resolveSymbols(cfg.FallbackRaw, cfg.FallbackSeed)
+		fmt.Printf("CONFIG symbol_discovery_failed source=all_venues err=%v fallback=%s\n", err, strings.Join(fallback, ","))
+		return fallback
+	}
+	fmt.Printf("CONFIG symbol_discovery_ok source=all_venues count=%d\n", len(symbols))
+	return symbols
+}
+
+func ensurePaperUniverse(existing []string) []string {
+	cfg := loadPaperUniverseConfig(envString("BOT_SYMBOLS", "BTCUSDT"), "BTCUSDT")
+	if cfg.Mode == "static" {
+		if len(existing) > 0 {
+			return existing
+		}
+		return resolveSymbols(cfg.FallbackRaw, cfg.FallbackSeed)
+	}
+	symbols, err := discoverPaperSymbols(cfg)
+	if err != nil {
+		if len(existing) > 0 {
+			fmt.Printf("CONFIG symbol_discovery_refresh_failed source=all_venues err=%v keep_existing=%s\n", err, strings.Join(existing, ","))
+			return existing
+		}
+		fallback := resolveSymbols(cfg.FallbackRaw, cfg.FallbackSeed)
+		fmt.Printf("CONFIG symbol_discovery_failed source=all_venues err=%v fallback=%s\n", err, strings.Join(fallback, ","))
+		return fallback
+	}
+	return symbols
+}
+
+func shouldRefreshPaperUniverse(symbols []string, nextRefresh time.Time) bool {
+	cfg := loadPaperUniverseConfig(envString("BOT_SYMBOLS", "BTCUSDT"), "BTCUSDT")
+	if cfg.Mode == "static" {
+		return false
+	}
+	if len(symbols) == 0 {
+		return true
+	}
+	return time.Now().After(nextRefresh)
+}
+
+func discoverPaperSymbols(cfg paperUniverseConfig) ([]string, error) {
+	symbols, err := discoverAllVenueSymbols()
+	if err != nil {
+		return nil, err
+	}
+	limit := cfg.MaxSymbols
+	if limit > 0 && len(symbols) > limit {
+		symbols = symbols[:limit]
+	}
+	if len(symbols) == 0 {
+		return nil, fmt.Errorf("symbol discovery returned zero assets")
+	}
+	return symbols, nil
+}
+
+func discoverAllVenueSymbols() ([]string, error) {
+	type venueResult struct {
+		name    string
+		symbols []string
+		err     error
+	}
+	results := []venueResult{
+		{name: "hyperliquid", symbols: nil, err: nil},
+		{name: "aster", symbols: nil, err: nil},
+		{name: "lighter", symbols: nil, err: nil},
+	}
+
+	results[0].symbols, results[0].err = discoverHyperliquidSymbols()
+	results[1].symbols, results[1].err = discoverAsterSymbols(envString("ASTER_BASE_URL", "https://fapi.asterdex.com"))
+	results[2].symbols, results[2].err = discoverLighterSymbols(envString("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai"))
+
+	merged := make([]string, 0)
+	errs := make([]string, 0)
+	for _, res := range results {
+		if res.err != nil {
+			errs = append(errs, fmt.Sprintf("%s:%v", res.name, res.err))
+			continue
+		}
+		merged = append(merged, res.symbols...)
+	}
+	merged = dedupeSymbols(merged)
+	sort.Strings(merged)
+	if len(merged) == 0 {
+		if len(errs) == 0 {
+			return nil, fmt.Errorf("symbol discovery returned zero assets")
+		}
+		return nil, fmt.Errorf("all venue discovery failed: %s", strings.Join(errs, "; "))
+	}
+	if len(errs) > 0 {
+		fmt.Printf("CONFIG symbol_discovery_partial warning=%s\n", strings.Join(errs, "; "))
+	}
+	return merged, nil
+}
+
+func discoverHyperliquidSymbols() ([]string, error) {
+	hl := hlsdk.NewHyperliquid(&hlsdk.HyperliquidClientConfig{IsMainnet: true})
+	meta, err := hl.InfoAPI.GetMeta()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(meta.Universe))
+	for _, asset := range meta.Universe {
+		if asset.IsDelisted {
+			continue
+		}
+		name := strings.ToUpper(strings.TrimSpace(asset.Name))
+		if name == "" {
+			continue
+		}
+		out = append(out, name+"USDT")
+	}
+	sort.Strings(out)
+	return dedupeSymbols(out), nil
+}
+
+func discoverAsterSymbols(baseURL string) ([]string, error) {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = "https://fapi.asterdex.com"
+	}
+	u := base + "/fapi/v1/exchangeInfo"
+	resp, err := (&http.Client{Timeout: 12 * time.Second}).Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("aster exchangeInfo status=%d", resp.StatusCode)
+	}
+	var payload struct {
+		Symbols []struct {
+			Symbol       string `json:"symbol"`
+			Status       string `json:"status"`
+			ContractType string `json:"contractType"`
+			Pair         string `json:"pair"`
+			QuoteAsset   string `json:"quoteAsset"`
+		} `json:"symbols"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(payload.Symbols))
+	for _, item := range payload.Symbols {
+		if !asterSymbolEligible(item.Status, item.ContractType) {
+			continue
+		}
+		sym := strings.ToUpper(strings.TrimSpace(item.Symbol))
+		if sym == "" || !strings.HasSuffix(sym, "USDT") {
+			continue
+		}
+		out = append(out, sym)
+	}
+	sort.Strings(out)
+	return dedupeSymbols(out), nil
+}
+
+func asterSymbolEligible(status, contractType string) bool {
+	s := strings.ToUpper(strings.TrimSpace(status))
+	if s != "" && s != "TRADING" {
+		return false
+	}
+	ct := strings.ToUpper(strings.TrimSpace(contractType))
+	return ct == "" || strings.Contains(ct, "PERPETUAL")
+}
+
+func discoverLighterSymbols(baseURL string) ([]string, error) {
+	cli := lighter.NewClient(baseURL)
+	obs, err := cli.OrderBooks("perp")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(obs.OrderBooks))
+	for _, ob := range obs.OrderBooks {
+		if !lighterSymbolEligible(ob.Status) {
+			continue
+		}
+		sym := strings.ToUpper(strings.TrimSpace(ob.Symbol))
+		if sym == "" {
+			continue
+		}
+		out = append(out, sym)
+	}
+	sort.Strings(out)
+	return dedupeSymbols(out), nil
+}
+
+func lighterSymbolEligible(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	switch s {
+	case "", "active", "open", "trading", "live":
+		return true
+	case "delisted", "closed", "settled", "inactive", "halted":
+		return false
+	default:
+		return true
+	}
+}
+
+func dedupeSymbols(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, s := range in {
+		s = strings.ToUpper(strings.TrimSpace(s))
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []string, error) {

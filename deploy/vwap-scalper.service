@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
+User=traderbot
 WorkingDirectory=/opt/vwap-scalper
 EnvironmentFile=/opt/vwap-scalper/.env
 ExecStart=/opt/vwap-scalper/vwap-live --start
@@ -16,4 +16,3 @@ StandardError=append:/opt/vwap-scalper/out/live.err.log
 
 [Install]
 WantedBy=multi-user.target
-
