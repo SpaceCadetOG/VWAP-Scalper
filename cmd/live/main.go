@@ -21,6 +21,7 @@ import (
 	ws "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/ws"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/marketstate"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/models"
+	"github.com/SpaceCadetOG/VWAP-Scalper/internal/observability"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/replay"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/router"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/strategycore"
@@ -146,6 +147,7 @@ func runPaperRoute(symbol string, notionalUSD float64) {
 
 func runPaperE2E(symbol string, notionalUSD float64) {
 	fmt.Println("=== STEP 11 PAPER E2E ===")
+	notifier := observability.NewNotifierFromEnv()
 	snap := marketstate.Snapshot{
 		Price:             envFloat("SIM_PRICE", 43000),
 		SessionVWAP:       envFloat("SIM_SESSION_VWAP", 42990),
@@ -155,11 +157,25 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 		Delta:             envFloat("SIM_DELTA", 0.3),
 		DeltaFlipStrength: envFloat("SIM_DELTA_FLIP_STRENGTH", 0.25),
 	}
+	if envBool("SIM_USE_LIVE_SNAPSHOT", false) {
+		liveSnap, err := marketstate.BuildLiveSnapshot(marketstate.LiveSnapshotConfig{
+			HyperliquidBaseURL: envString("HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"),
+			AsterBaseURL:       envString("ASTER_BASE_URL", "https://fapi.asterdex.com"),
+			Timeout:            5 * time.Second,
+		}, symbol)
+		if err != nil {
+			fmt.Printf("live_snapshot_fallback err=%v\n", err)
+		} else {
+			snap = liveSnap
+			fmt.Printf("live_snapshot_loaded price=%.6f session_vwap=%.6f anchored_vwap=%.6f\n", snap.Price, snap.SessionVWAP, snap.AnchoredVWAP)
+		}
+	}
 
 	detector := marketstate.NewDetector()
 	state := detector.Detect(snap)
 	fmt.Printf("market_state state=%s confidence=%d invalidators=%v expiry_ms=%d\n",
 		state.State, state.ConfidenceScore, state.Invalidators, state.ExpiryMs)
+	notifyBestEffort(notifier, "market_state", fmt.Sprintf("symbol=%s state=%s confidence=%d", symbol, state.State, state.ConfidenceScore))
 
 	comp := strategycore.NewCompiler(envInt("STRATEGY_MIN_CONFIDENCE_PAPER", 70))
 	intent, err := comp.Compile(strategycore.CompileInput{
@@ -172,16 +188,19 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 	})
 	if err != nil {
 		fmt.Printf("strategy_intent_rejected err=%v\n", err)
+		notifyBestEffort(notifier, "strategy_reject", fmt.Sprintf("symbol=%s err=%v", symbol, err))
 		os.Exit(1)
 	}
 	fmt.Printf("strategy_intent signal_id=%s setup=%s side=%s pair=%s notional_usd=%.4f\n",
 		intent.SignalID, intent.Setup, intent.Side, intent.CanonicalPair, intent.NotionalUSD)
+	notifyBestEffort(notifier, "strategy_intent", fmt.Sprintf("signal_id=%s side=%s pair=%s notional=%.4f", intent.SignalID, intent.Side, intent.CanonicalPair, intent.NotionalUSD))
 
 	cfg := loadRouterConfigFromEnv()
 	statuses := collectVenueStatusForPaper()
 	plan := router.BuildPlan(intent, statuses, cfg)
 	if !plan.Accepted {
 		fmt.Printf("router_plan_rejected reason=%s detail=%s\n", plan.Reason, plan.ReasonText)
+		notifyBestEffort(notifier, "router_reject", fmt.Sprintf("reason=%s detail=%s", plan.Reason, plan.ReasonText))
 		for _, r := range plan.Rejected {
 			fmt.Printf("venue_reject venue=%s reason=%s detail=%s\n", r.Venue, r.Reason, r.Detail)
 		}
@@ -189,6 +208,7 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 	}
 
 	fmt.Printf("router_plan_accepted allocations=%d\n", len(plan.Allocations))
+	notifyBestEffort(notifier, "router_plan", fmt.Sprintf("accepted allocations=%d", len(plan.Allocations)))
 	for _, a := range plan.Allocations {
 		fmt.Printf("alloc venue=%s weight=%.4f notional_usd=%.4f\n", a.Venue, a.Weight, a.NotionalUSD)
 	}
@@ -200,9 +220,20 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 	})
 	res := engine.ExecutePlan(plan)
 	fmt.Printf("paper_exec accepted=%t total_notional_usd=%.4f total_net_cost=%.4f\n", res.Accepted, res.TotalNotional, res.TotalNetCost)
+	notifyBestEffort(notifier, "paper_exec", fmt.Sprintf("accepted=%t total_notional=%.4f total_net_cost=%.4f", res.Accepted, res.TotalNotional, res.TotalNetCost))
 	for _, ex := range res.Executions {
 		fmt.Printf("paper_fill venue=%s state=%s notional_usd=%.4f fee_cost=%.4f slippage_cost=%.4f latency_ms=%d\n",
 			ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost, ex.LatencyMs)
+		notifyBestEffort(notifier, "paper_fill", fmt.Sprintf("venue=%s state=%s notional=%.4f fee=%.4f slip=%.4f", ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost))
+	}
+}
+
+func notifyBestEffort(n *observability.Notifier, event, msg string) {
+	if n == nil || !n.Enabled() {
+		return
+	}
+	if err := n.Send(event, msg); err != nil {
+		fmt.Printf("alert_send_failed event=%s err=%v\n", event, err)
 	}
 }
 
