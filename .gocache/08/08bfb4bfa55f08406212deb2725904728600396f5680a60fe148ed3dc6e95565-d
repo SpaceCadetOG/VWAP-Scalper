@@ -1,0 +1,5 @@
+./canonical_models_test.go
+./nonce_manager_test.go
+./signer_services_test.go
+./symbol_metadata_test.go
+./ws_feed_health_test.go

@@ -1,0 +1,10 @@
+=== RUN   TestAcceptanceContracts
+=== RUN   TestAcceptanceContracts/hyperliquid_perps_read_contract
+=== RUN   TestAcceptanceContracts/aster_pro_api_wallet_contract
+=== RUN   TestAcceptanceContracts/lighter_account_contract
+--- PASS: TestAcceptanceContracts (4.27s)
+    --- PASS: TestAcceptanceContracts/hyperliquid_perps_read_contract (1.40s)
+    --- PASS: TestAcceptanceContracts/aster_pro_api_wallet_contract (1.81s)
+    --- PASS: TestAcceptanceContracts/lighter_account_contract (1.06s)
+PASS
+ok  	github.com/SpaceCadetOG/VWAP-Scalper/tests	6.881s

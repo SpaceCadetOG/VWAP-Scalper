@@ -1,0 +1,4 @@
+./branch_hint.go
+./goldilocks_gnark.go
+./goldilocks_plonky2.go
+./branch_hint.s

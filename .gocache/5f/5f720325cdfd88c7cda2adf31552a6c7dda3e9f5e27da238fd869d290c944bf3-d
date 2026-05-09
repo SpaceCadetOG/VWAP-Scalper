@@ -1,0 +1,7 @@
+./affine_point.go
+./point.go
+./scalar_field.go
+./signed161.go
+./signed640.go
+./u128.go
+./weierstrass_point.go

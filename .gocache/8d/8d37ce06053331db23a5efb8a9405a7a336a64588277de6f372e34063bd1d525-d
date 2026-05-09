@@ -1,0 +1,22 @@
+# test log
+getenv ACCEPTANCE_LIVE
+getenv HYPERLIQUID_ACCOUNT_ADDRESS
+getenv HYPERLIQUID_BASE_URL
+getenv HTTP_PROXY
+getenv http_proxy
+getenv HTTPS_PROXY
+getenv https_proxy
+getenv NO_PROXY
+getenv no_proxy
+getenv REQUEST_METHOD
+getenv ASTER_CHAIN_ID
+getenv ASTER_SIGNER
+getenv ASTER_SIGNER_ADDRESS
+getenv ASTER_PRIVATE_KEY
+getenv ASTER_SIGNER_PRIVATE_KEY
+getenv ASTER_BASE_URL
+getenv ASTER_USER
+getenv ASTER_API_KEY
+getenv ASTER_API_SECRET
+getenv LIGHTER_BASE_URL
+getenv LIGHTER_ACCOUNT_INDEX

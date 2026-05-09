@@ -1,0 +1,8 @@
+./arith.go
+./doc.go
+./element.go
+./element_exp.go
+./element_purego.go
+./generator.go
+./vector.go
+./vector_purego.go

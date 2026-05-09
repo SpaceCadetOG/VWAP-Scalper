@@ -1,0 +1,15 @@
+./api.go
+./client.go
+./consts.go
+./convert.go
+./exchange_service.go
+./exchange_signing.go
+./exchange_types.go
+./hyperliquid.go
+./info_service.go
+./info_types.go
+./json_utils.go
+./pk_manager.go
+./signature.go
+./utils.go
+./websocket.go
