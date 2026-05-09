@@ -195,32 +195,34 @@ func runPaperDaemon(symbol string, notionalUSD float64) {
 func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) {
 	fmt.Println("=== STEP 11 PAPER E2E ===")
 	notifier := observability.NewNotifierFromEnv()
-	snap := marketstate.Snapshot{
-		Price:             envFloat("SIM_PRICE", 43000),
-		SessionVWAP:       envFloat("SIM_SESSION_VWAP", 42990),
-		AnchoredVWAP:      envFloat("SIM_ANCHORED_VWAP", 42992),
-		EMA9:              envFloat("SIM_EMA9", 43010),
-		EMA20:             envFloat("SIM_EMA20", 42980),
-		HTFAligned:        envBool("SIM_HTF_ALIGNED", true),
-		ProfileReady:      envBool("SIM_PROFILE_READY", true),
-		TapeReady:         envBool("SIM_TAPE_READY", true),
-		ATRRatio:          envFloat("SIM_ATR_RATIO", 0.75),
-		VolumeRatio:       envFloat("SIM_VOLUME_RATIO", 1.2),
-		Delta:             envFloat("SIM_DELTA", 0.3),
-		DeltaFlipStrength: envFloat("SIM_DELTA_FLIP_STRENGTH", 0.25),
+	if !envBool("SIM_USE_LIVE_SNAPSHOT", true) {
+		return router.Intent{}, fmt.Errorf("SIM_USE_LIVE_SNAPSHOT must be true (no placeholder mode)")
 	}
-	if envBool("SIM_USE_LIVE_SNAPSHOT", false) {
-		liveSnap, err := marketstate.BuildLiveSnapshot(marketstate.LiveSnapshotConfig{
-			HyperliquidBaseURL: envString("HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"),
-			AsterBaseURL:       envString("ASTER_BASE_URL", "https://fapi.asterdex.com"),
-			Timeout:            5 * time.Second,
-		}, symbol)
-		if err != nil {
-			fmt.Printf("live_snapshot_fallback err=%v\n", err)
-		} else {
-			snap = liveSnap
-			fmt.Printf("live_snapshot_loaded price=%.6f session_vwap=%.6f anchored_vwap=%.6f\n", snap.Price, snap.SessionVWAP, snap.AnchoredVWAP)
-		}
+	snap, err := marketstate.BuildLiveSnapshot(marketstate.LiveSnapshotConfig{
+		HyperliquidBaseURL: envString("HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"),
+		AsterBaseURL:       envString("ASTER_BASE_URL", "https://fapi.asterdex.com"),
+		Timeout:            5 * time.Second,
+	}, symbol)
+	if err != nil {
+		return router.Intent{}, fmt.Errorf("live snapshot required: %w", err)
+	}
+	snap.EMA9 = envFloat("SIM_EMA9", snap.Price*1.0002)
+	snap.EMA20 = envFloat("SIM_EMA20", snap.Price*0.9998)
+	snap.HTFAligned = envBool("SIM_HTF_ALIGNED", true)
+	snap.ProfileReady = envBool("SIM_PROFILE_READY", true)
+	snap.TapeReady = envBool("SIM_TAPE_READY", true)
+	fmt.Printf("live_snapshot_loaded price=%.6f session_vwap=%.6f anchored_vwap=%.6f\n", snap.Price, snap.SessionVWAP, snap.AnchoredVWAP)
+
+	paper := replay.NewPaperTrader(replay.TraderConfig{
+		StateFile:      envString("PAPER_STATE_FILE", "out/paper_state.json"),
+		StartBalance:   envFloat("PAPER_START_BALANCE", 1000),
+		StopPct:        envFloat("PAPER_STOP_PCT", 0.006),
+		TakeProfitPct:  envFloat("PAPER_TP_PCT", 0.009),
+		MaxHoldSeconds: envInt("PAPER_MAX_HOLD_SEC", 180),
+	})
+	if tr := paper.Mark(symbol, snap.Price, time.Now().UTC()); tr != nil {
+		fmt.Printf("paper_exit symbol=%s side=%s reason=%s pnl_usd=%.4f balance_usd=%.4f\n", tr.Symbol, tr.Side, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD)
+		notifyBestEffort(notifier, "paper_exit", fmt.Sprintf("symbol=%s reason=%s pnl=%.4f balance=%.4f", tr.Symbol, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD))
 	}
 
 	detector := marketstate.NewDetector()
@@ -277,6 +279,13 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		fmt.Printf("paper_fill venue=%s state=%s notional_usd=%.4f fee_cost=%.4f slippage_cost=%.4f latency_ms=%d\n",
 			ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost, ex.LatencyMs)
 		notifyBestEffort(notifier, "paper_fill", fmt.Sprintf("venue=%s state=%s notional=%.4f fee=%.4f slip=%.4f", ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost))
+	}
+	if err := paper.OnSignal(intent, snap.Price, time.Now().UTC()); err != nil {
+		fmt.Printf("paper_entry_skip err=%v\n", err)
+	} else {
+		st := paper.State()
+		fmt.Printf("paper_entry symbol=%s side=%s price=%.4f open_positions=%d balance_usd=%.4f\n", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD)
+		notifyBestEffort(notifier, "paper_entry", fmt.Sprintf("symbol=%s side=%s price=%.4f open_positions=%d balance=%.4f", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD))
 	}
 	return intent, nil
 }
