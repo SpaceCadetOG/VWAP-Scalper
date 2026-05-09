@@ -36,4 +36,3 @@ func NormalizeVenueOrderState(raw string) ExecState {
 		return ExecStateUnknown
 	}
 }
-

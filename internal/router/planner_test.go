@@ -104,14 +104,14 @@ func TestBuildPlan_SingleVenueMode(t *testing.T) {
 
 func TestNormalizeVenueOrderState(t *testing.T) {
 	cases := map[string]ExecState{
-		"new":              ExecStateSubmitted,
-		"accepted":         ExecStateAccepted,
-		"partial_fill":     ExecStatePartial,
-		"filled":           ExecStateFilled,
-		"cancelled":        ExecStateCanceled,
-		"rejected":         ExecStateRejected,
-		"expired":          ExecStateExpired,
-		"something_weird":  ExecStateUnknown,
+		"new":             ExecStateSubmitted,
+		"accepted":        ExecStateAccepted,
+		"partial_fill":    ExecStatePartial,
+		"filled":          ExecStateFilled,
+		"cancelled":       ExecStateCanceled,
+		"rejected":        ExecStateRejected,
+		"expired":         ExecStateExpired,
+		"something_weird": ExecStateUnknown,
 	}
 	for raw, want := range cases {
 		got := NormalizeVenueOrderState(raw)
@@ -120,4 +120,3 @@ func TestNormalizeVenueOrderState(t *testing.T) {
 		}
 	}
 }
-

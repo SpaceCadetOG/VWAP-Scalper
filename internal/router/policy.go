@@ -20,4 +20,3 @@ func validateConfig(cfg Config) error {
 		return fmt.Errorf("unsupported venue split mode: %s", cfg.VenueRiskSplitMode)
 	}
 }
-

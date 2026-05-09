@@ -42,4 +42,3 @@ func selectEligible(status []VenueStatus, cfg Config) (eligible []VenueStatus, r
 
 	return eligible, rejected
 }
-

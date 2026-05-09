@@ -126,4 +126,3 @@ func round4(v float64) float64 {
 	}
 	return float64(int(v*m-0.5)) / m
 }
-

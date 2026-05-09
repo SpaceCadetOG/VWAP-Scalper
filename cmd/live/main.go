@@ -8,16 +8,20 @@ import (
 	"math/big"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	aster "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/aster"
 	accountstream "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/accountstream"
+	aster "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/aster"
 	coinbase "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/coinbase"
 	hyperliquid "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/hyperliquid"
 	lighter "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/lighter"
 	ws "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/ws"
+	"github.com/SpaceCadetOG/VWAP-Scalper/internal/models"
+	"github.com/SpaceCadetOG/VWAP-Scalper/internal/replay"
+	"github.com/SpaceCadetOG/VWAP-Scalper/internal/router"
 	lgclient "github.com/elliottech/lighter-go/client"
 	lhttp "github.com/elliottech/lighter-go/client/http"
 	ltypes "github.com/elliottech/lighter-go/types"
@@ -29,6 +33,7 @@ func main() {
 	checkBalances := flag.Bool("check-balances", false, "run venue balance connectivity checks")
 	checkWS := flag.Bool("check-ws", false, "run websocket connectivity checks (WS-first health)")
 	checkAccountStreams := flag.Bool("check-account-streams", false, "run account stream readiness/connectivity checks (Step 7)")
+	paperRoute := flag.Bool("paper-route", false, "run Step 9 paper/replay routing simulation (no live orders)")
 	testTrade := flag.Bool("test-trade", false, "place a small live test trade and collect order/fill details")
 	testOrderTypes := flag.Bool("test-order-types", false, "place/cancel small Aster order-type smoke tests")
 	testBatch := flag.Bool("test-batch", false, "run live batch-order smoke tests")
@@ -49,6 +54,10 @@ func main() {
 
 	if *testTrade {
 		runTestTrade(strings.ToLower(strings.TrimSpace(*venue)), strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
+		return
+	}
+	if *paperRoute {
+		runPaperRoute(strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
 		return
 	}
 
@@ -85,6 +94,154 @@ func main() {
 		fmt.Printf("unknown venue %q\n", *venue)
 		os.Exit(2)
 	}
+}
+
+func runPaperRoute(symbol string, notionalUSD float64) {
+	fmt.Println("=== STEP 9 PAPER ROUTE ===")
+	cfg := loadRouterConfigFromEnv()
+	statuses := collectVenueStatusForPaper()
+	intent := router.Intent{
+		SignalID:      fmt.Sprintf("paper-%d", time.Now().UnixMilli()),
+		Setup:         "VWAP_HYBRID_CONFLUENCE",
+		CanonicalPair: symbol,
+		Side:          router.SideBuy,
+		NotionalUSD:   notionalUSD,
+	}
+	plan := router.BuildPlan(intent, statuses, cfg)
+	if !plan.Accepted {
+		fmt.Printf("paper_plan_rejected reason=%s detail=%s\n", plan.Reason, plan.ReasonText)
+		for _, r := range plan.Rejected {
+			fmt.Printf("venue_reject venue=%s reason=%s detail=%s\n", r.Venue, r.Reason, r.Detail)
+		}
+		os.Exit(1)
+	}
+
+	fmt.Printf("paper_plan_accepted signal_id=%s allocations=%d\n", plan.Intent.SignalID, len(plan.Allocations))
+	for _, a := range plan.Allocations {
+		fmt.Printf("alloc venue=%s weight=%.4f notional_usd=%.4f\n", a.Venue, a.Weight, a.NotionalUSD)
+	}
+	for _, r := range plan.Rejected {
+		fmt.Printf("venue_reject venue=%s reason=%s detail=%s\n", r.Venue, r.Reason, r.Detail)
+	}
+
+	engine := replay.NewEngine(replay.FillModel{
+		SlippageBps: envFloat("PAPER_SLIPPAGE_BPS", 2.0),
+		FeeBps:      envFloat("PAPER_FEE_BPS", 3.5),
+		LatencyMs:   int64(envInt("PAPER_LATENCY_MS", 250)),
+	})
+	res := engine.ExecutePlan(plan)
+	fmt.Printf("paper_exec accepted=%t total_notional_usd=%.4f total_net_cost=%.4f\n", res.Accepted, res.TotalNotional, res.TotalNetCost)
+	for _, ex := range res.Executions {
+		fmt.Printf("paper_fill venue=%s state=%s notional_usd=%.4f fee_cost=%.4f slippage_cost=%.4f latency_ms=%d\n",
+			ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost, ex.LatencyMs)
+	}
+}
+
+func loadRouterConfigFromEnv() router.Config {
+	cfg := router.DefaultConfig()
+	cfg.MultiVenueEnable = envBool("ROUTER_MULTI_VENUE_ENABLE", cfg.MultiVenueEnable)
+	cfg.MaxVenuesPerSignal = envInt("ROUTER_MAX_VENUES_PER_SIGNAL", cfg.MaxVenuesPerSignal)
+	cfg.GlobalRiskPerSignalUSD = envFloat("ROUTER_GLOBAL_RISK_PER_SIGNAL_USD", cfg.GlobalRiskPerSignalUSD)
+	cfg.VenueRiskSplitMode = envString("ROUTER_VENUE_RISK_SPLIT_MODE", cfg.VenueRiskSplitMode)
+	cfg.RequireIsolated = envBool("ROUTER_REQUIRE_ISOLATED", cfg.RequireIsolated)
+	return cfg
+}
+
+func collectVenueStatusForPaper() []router.VenueStatus {
+	type v struct {
+		name  string
+		venue models.Venue
+	}
+	all := []v{
+		{name: "hyperliquid", venue: models.VenueHyperliquid},
+		{name: "aster", venue: models.VenueAster},
+		{name: "lighter", venue: models.VenueLighter},
+	}
+	out := make([]router.VenueStatus, 0, len(all))
+	for _, it := range all {
+		rd := accountstream.ProbeReadiness(it.name)
+		wsr := accountstream.ProbeConnectivity(it.name)
+		s := router.VenueStatus{
+			Venue:                 it.venue,
+			Healthy:               rd.Ready && wsr.OK,
+			SupportsPerpExecution: true,
+			IsolatedConfirmed:     venueIsolatedConfirmed(it.name),
+			Score:                 venueScore(it.name),
+		}
+		out = append(out, s)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Score > out[j].Score })
+	return out
+}
+
+func venueIsolatedConfirmed(venue string) bool {
+	switch venue {
+	case "lighter":
+		return strings.EqualFold(strings.TrimSpace(os.Getenv("LIGHTER_MARGIN_MODE")), "isolated") &&
+			strings.EqualFold(strings.TrimSpace(os.Getenv("LIGHTER_ISOLATED_CONFIRMED")), "true")
+	case "hyperliquid":
+		return strings.TrimSpace(os.Getenv("HYPERLIQUID_ACCOUNT_ADDRESS")) != "" &&
+			strings.TrimSpace(os.Getenv("HYPERLIQUID_API_WALLET_PRIVATE_KEY")) != ""
+	case "aster":
+		return strings.TrimSpace(os.Getenv("ASTER_USER")) != "" &&
+			(strings.TrimSpace(os.Getenv("ASTER_SIGNER")) != "" || strings.TrimSpace(os.Getenv("ASTER_SIGNER_ADDRESS")) != "") &&
+			(strings.TrimSpace(os.Getenv("ASTER_PRIVATE_KEY")) != "" || strings.TrimSpace(os.Getenv("ASTER_SIGNER_PRIVATE_KEY")) != "")
+	default:
+		return false
+	}
+}
+
+func venueScore(venue string) float64 {
+	switch venue {
+	case "hyperliquid":
+		return envFloat("ROUTER_SCORE_HYPERLIQUID", 1.0)
+	case "aster":
+		return envFloat("ROUTER_SCORE_ASTER", 1.0)
+	case "lighter":
+		return envFloat("ROUTER_SCORE_LIGHTER", 1.0)
+	default:
+		return 1.0
+	}
+}
+
+func envString(key, def string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func envFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func envBool(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	return strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes")
 }
 
 func runTestTrade(venue, symbol string, notionalUSD float64) {
@@ -2050,14 +2207,18 @@ func runHyperliquidBalanceCheck(exitOnErr bool) {
 	addr := strings.TrimSpace(os.Getenv("HYPERLIQUID_ACCOUNT_ADDRESS"))
 	if addr == "" {
 		fmt.Println("HYPERLIQUID_ACCOUNT_ADDRESS missing")
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 	cli := hyperliquid.NewClient(strings.TrimSpace(os.Getenv("HYPERLIQUID_BASE_URL")))
 	state, err := cli.ClearinghouseState(addr)
 	if err != nil {
 		fmt.Printf("HYPERLIQUID check failed: %v\n", err)
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 	ms, _ := state["marginSummary"].(map[string]any)
@@ -2126,26 +2287,34 @@ func runAsterBalanceCheck(exitOnErr bool) {
 	})
 	if err != nil {
 		fmt.Printf("ASTER init failed: %v\n", err)
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 
 	if err := cli.Ping(); err != nil {
 		fmt.Printf("ASTER ping failed: %v\n", err)
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 
 	acct, err := cli.GetAccountSummaryRaw()
 	if err != nil {
 		fmt.Printf("ASTER account failed: %v\n", err)
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 	bals, err := cli.GetBalanceRaw()
 	if err != nil {
 		fmt.Printf("ASTER balance failed: %v\n", err)
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -2196,7 +2365,9 @@ func runLighterBalanceCheck(exitOnErr bool) {
 	cli := lighter.NewClient(strings.TrimSpace(os.Getenv("LIGHTER_BASE_URL")))
 	if err := cli.Health(); err != nil {
 		fmt.Printf("LIGHTER health failed: %v\n", err)
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 	var acc *lighter.AccountByL1Response
@@ -2210,7 +2381,9 @@ func runLighterBalanceCheck(exitOnErr bool) {
 	if err != nil || acc == nil {
 		if addr == "" {
 			fmt.Println("LIGHTER_ACCOUNT_INDEX missing and no LIGHTER_L1_ADDRESS/HYPERLIQUID_ACCOUNT_ADDRESS fallback")
-			if exitOnErr { os.Exit(1) }
+			if exitOnErr {
+				os.Exit(1)
+			}
 			return
 		}
 		acc, err = cli.AccountByL1(addr)
@@ -2220,7 +2393,9 @@ func runLighterBalanceCheck(exitOnErr bool) {
 	}
 	if err != nil {
 		fmt.Printf("LIGHTER account failed: %v\n", err)
-		if exitOnErr { os.Exit(1) }
+		if exitOnErr {
+			os.Exit(1)
+		}
 		return
 	}
 	fmt.Printf("accounts=%d total=%d\n", len(acc.Accounts), acc.Total)

@@ -96,4 +96,3 @@ type Plan struct {
 	Allocations []Allocation
 	Rejected    []VenueReject
 }
-
