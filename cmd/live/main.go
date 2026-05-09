@@ -19,9 +19,11 @@ import (
 	hyperliquid "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/hyperliquid"
 	lighter "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/lighter"
 	ws "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/ws"
+	"github.com/SpaceCadetOG/VWAP-Scalper/internal/marketstate"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/models"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/replay"
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/router"
+	"github.com/SpaceCadetOG/VWAP-Scalper/internal/strategycore"
 	lgclient "github.com/elliottech/lighter-go/client"
 	lhttp "github.com/elliottech/lighter-go/client/http"
 	ltypes "github.com/elliottech/lighter-go/types"
@@ -34,6 +36,7 @@ func main() {
 	checkWS := flag.Bool("check-ws", false, "run websocket connectivity checks (WS-first health)")
 	checkAccountStreams := flag.Bool("check-account-streams", false, "run account stream readiness/connectivity checks (Step 7)")
 	paperRoute := flag.Bool("paper-route", false, "run Step 9 paper/replay routing simulation (no live orders)")
+	paperE2E := flag.Bool("paper-e2e", false, "run strategycore+marketstate+router+paper end-to-end simulation")
 	testTrade := flag.Bool("test-trade", false, "place a small live test trade and collect order/fill details")
 	testOrderTypes := flag.Bool("test-order-types", false, "place/cancel small Aster order-type smoke tests")
 	testBatch := flag.Bool("test-batch", false, "run live batch-order smoke tests")
@@ -58,6 +61,10 @@ func main() {
 	}
 	if *paperRoute {
 		runPaperRoute(strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
+		return
+	}
+	if *paperE2E {
+		runPaperE2E(strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
 		return
 	}
 
@@ -122,6 +129,68 @@ func runPaperRoute(symbol string, notionalUSD float64) {
 	}
 	for _, r := range plan.Rejected {
 		fmt.Printf("venue_reject venue=%s reason=%s detail=%s\n", r.Venue, r.Reason, r.Detail)
+	}
+
+	engine := replay.NewEngine(replay.FillModel{
+		SlippageBps: envFloat("PAPER_SLIPPAGE_BPS", 2.0),
+		FeeBps:      envFloat("PAPER_FEE_BPS", 3.5),
+		LatencyMs:   int64(envInt("PAPER_LATENCY_MS", 250)),
+	})
+	res := engine.ExecutePlan(plan)
+	fmt.Printf("paper_exec accepted=%t total_notional_usd=%.4f total_net_cost=%.4f\n", res.Accepted, res.TotalNotional, res.TotalNetCost)
+	for _, ex := range res.Executions {
+		fmt.Printf("paper_fill venue=%s state=%s notional_usd=%.4f fee_cost=%.4f slippage_cost=%.4f latency_ms=%d\n",
+			ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost, ex.LatencyMs)
+	}
+}
+
+func runPaperE2E(symbol string, notionalUSD float64) {
+	fmt.Println("=== STEP 11 PAPER E2E ===")
+	snap := marketstate.Snapshot{
+		Price:             envFloat("SIM_PRICE", 43000),
+		SessionVWAP:       envFloat("SIM_SESSION_VWAP", 42990),
+		AnchoredVWAP:      envFloat("SIM_ANCHORED_VWAP", 42992),
+		ATRRatio:          envFloat("SIM_ATR_RATIO", 0.75),
+		VolumeRatio:       envFloat("SIM_VOLUME_RATIO", 1.2),
+		Delta:             envFloat("SIM_DELTA", 0.3),
+		DeltaFlipStrength: envFloat("SIM_DELTA_FLIP_STRENGTH", 0.25),
+	}
+
+	detector := marketstate.NewDetector()
+	state := detector.Detect(snap)
+	fmt.Printf("market_state state=%s confidence=%d invalidators=%v expiry_ms=%d\n",
+		state.State, state.ConfidenceScore, state.Invalidators, state.ExpiryMs)
+
+	comp := strategycore.NewCompiler(envInt("STRATEGY_MIN_CONFIDENCE_PAPER", 70))
+	intent, err := comp.Compile(strategycore.CompileInput{
+		SignalID:      fmt.Sprintf("e2e-%d", time.Now().UnixMilli()),
+		CanonicalPair: symbol,
+		SetupName:     "VWAP_HYBRID_CONFLUENCE",
+		State:         state,
+		NotionalUSD:   notionalUSD,
+		Delta:         snap.Delta,
+	})
+	if err != nil {
+		fmt.Printf("strategy_intent_rejected err=%v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("strategy_intent signal_id=%s setup=%s side=%s pair=%s notional_usd=%.4f\n",
+		intent.SignalID, intent.Setup, intent.Side, intent.CanonicalPair, intent.NotionalUSD)
+
+	cfg := loadRouterConfigFromEnv()
+	statuses := collectVenueStatusForPaper()
+	plan := router.BuildPlan(intent, statuses, cfg)
+	if !plan.Accepted {
+		fmt.Printf("router_plan_rejected reason=%s detail=%s\n", plan.Reason, plan.ReasonText)
+		for _, r := range plan.Rejected {
+			fmt.Printf("venue_reject venue=%s reason=%s detail=%s\n", r.Venue, r.Reason, r.Detail)
+		}
+		os.Exit(1)
+	}
+
+	fmt.Printf("router_plan_accepted allocations=%d\n", len(plan.Allocations))
+	for _, a := range plan.Allocations {
+		fmt.Printf("alloc venue=%s weight=%.4f notional_usd=%.4f\n", a.Venue, a.Weight, a.NotionalUSD)
 	}
 
 	engine := replay.NewEngine(replay.FillModel{
