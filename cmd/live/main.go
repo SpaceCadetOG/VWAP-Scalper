@@ -128,7 +128,7 @@ func main() {
 func runPaperRoute(symbol string, notionalUSD float64) {
 	fmt.Println("=== STEP 9 PAPER ROUTE ===")
 	cfg := loadRouterConfigFromEnv()
-	statuses := collectVenueStatusForPaper()
+	statuses := collectVenueStatusForPaper(symbol)
 	intent := router.Intent{
 		SignalID:      fmt.Sprintf("paper-%d", time.Now().UnixMilli()),
 		Setup:         "VWAP_HYBRID_CONFLUENCE",
@@ -238,6 +238,54 @@ type paperUniverseConfig struct {
 	FallbackSeed string
 }
 
+type venueSymbolCatalog struct {
+	byCanonical map[string]map[string]string
+}
+
+func newVenueSymbolCatalog() *venueSymbolCatalog {
+	return &venueSymbolCatalog{byCanonical: map[string]map[string]string{}}
+}
+
+func (c *venueSymbolCatalog) Reset() {
+	c.byCanonical = map[string]map[string]string{}
+}
+
+func (c *venueSymbolCatalog) Upsert(canonical, venue, native string) {
+	canonical = canonicalAssetKey(canonical)
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	native = strings.ToUpper(strings.TrimSpace(native))
+	if canonical == "" || venue == "" || native == "" {
+		return
+	}
+	if _, ok := c.byCanonical[canonical]; !ok {
+		c.byCanonical[canonical] = map[string]string{}
+	}
+	c.byCanonical[canonical][venue] = native
+}
+
+func (c *venueSymbolCatalog) Has(canonical, venue string) bool {
+	canonical = canonicalAssetKey(canonical)
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	if byVenue, ok := c.byCanonical[canonical]; ok {
+		_, ok = byVenue[venue]
+		return ok
+	}
+	return false
+}
+
+func (c *venueSymbolCatalog) Native(canonical, venue string) string {
+	canonical = canonicalAssetKey(canonical)
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	if byVenue, ok := c.byCanonical[canonical]; ok {
+		if native, ok := byVenue[venue]; ok {
+			return native
+		}
+	}
+	return strings.ToUpper(strings.TrimSpace(canonical))
+}
+
+var paperVenueSymbols = newVenueSymbolCatalog()
+
 func loadPaperUniverseConfig(fallbackRaw, fallbackSeed string) paperUniverseConfig {
 	mode := strings.ToLower(strings.TrimSpace(envString("BOT_SYMBOL_SOURCE_MODE", "dynamic")))
 	if mode == "" {
@@ -315,6 +363,7 @@ func discoverPaperSymbols(cfg paperUniverseConfig) ([]string, error) {
 }
 
 func discoverAllVenueSymbols() ([]string, error) {
+	paperVenueSymbols.Reset()
 	type venueResult struct {
 		name    string
 		symbols []string
@@ -368,7 +417,9 @@ func discoverHyperliquidSymbols() ([]string, error) {
 		if name == "" {
 			continue
 		}
-		out = append(out, name+"USDT")
+		canonical := canonicalMarketSymbol(name)
+		paperVenueSymbols.Upsert(canonical, "hyperliquid", name)
+		out = append(out, canonical)
 	}
 	sort.Strings(out)
 	return dedupeSymbols(out), nil
@@ -410,7 +461,9 @@ func discoverAsterSymbols(baseURL string) ([]string, error) {
 		if sym == "" || !strings.HasSuffix(sym, "USDT") {
 			continue
 		}
-		out = append(out, sym)
+		canonical := canonicalMarketSymbol(sym)
+		paperVenueSymbols.Upsert(canonical, "aster", sym)
+		out = append(out, canonical)
 	}
 	sort.Strings(out)
 	return dedupeSymbols(out), nil
@@ -440,7 +493,9 @@ func discoverLighterSymbols(baseURL string) ([]string, error) {
 		if sym == "" {
 			continue
 		}
-		out = append(out, sym)
+		canonical := canonicalMarketSymbol(sym)
+		paperVenueSymbols.Upsert(canonical, "lighter", sym)
+		out = append(out, canonical)
 	}
 	sort.Strings(out)
 	return dedupeSymbols(out), nil
@@ -456,6 +511,30 @@ func lighterSymbolEligible(status string) bool {
 	default:
 		return true
 	}
+}
+
+func canonicalAssetKey(symbol string) string {
+	s := strings.ToUpper(strings.TrimSpace(symbol))
+	switch {
+	case strings.HasSuffix(s, "USDT"):
+		return strings.TrimSuffix(s, "USDT")
+	case strings.HasSuffix(s, "USD"):
+		return strings.TrimSuffix(s, "USD")
+	default:
+		return s
+	}
+}
+
+func canonicalMarketSymbol(symbol string) string {
+	key := canonicalAssetKey(symbol)
+	if key == "" {
+		return ""
+	}
+	return key + "USDT"
+}
+
+func nativeVenueSymbol(canonical, venue string) string {
+	return paperVenueSymbols.Native(canonical, venue)
 }
 
 func dedupeSymbols(in []string) []string {
@@ -489,11 +568,13 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 		RouteSplit: map[string]float64{},
 	}
 	paper := replay.NewPaperTrader(replay.TraderConfig{
-		StateFile:      envString("PAPER_STATE_FILE", "out/paper_state.json"),
-		StartBalance:   envFloat("PAPER_START_BALANCE", 100),
-		StopPct:        envFloat("PAPER_STOP_PCT", 0.006),
-		TakeProfitPct:  envFloat("PAPER_TP_PCT", 0.009),
-		MaxHoldSeconds: envInt("PAPER_MAX_HOLD_SEC", 180),
+		StateFile:       envString("PAPER_STATE_FILE", "out/paper_state.json"),
+		StartBalance:    envFloat("PAPER_START_BALANCE", 100),
+		StopPct:         envFloat("PAPER_STOP_PCT", 0.006),
+		TakeProfitPct:   envFloat("PAPER_TP_PCT", 0.009),
+		MaxHoldSeconds:  envInt("PAPER_MAX_HOLD_SEC", 180),
+		MaxOpenPerVenue: envInt("PAPER_MAX_OPEN_PER_VENUE", 8),
+		MaxOpenTotal:    envInt("PAPER_MAX_OPEN_TOTAL", 18),
 	})
 	notifier := observability.NewNotifierFromEnv()
 	if !envBool("SIM_USE_LIVE_SNAPSHOT", true) {
@@ -515,11 +596,6 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 		printCycleSummary(summary)
 		return router.Intent{}, nil, err
 	}
-	snap.EMA9 = envFloat("SIM_EMA9", snap.Price*1.0002)
-	snap.EMA20 = envFloat("SIM_EMA20", snap.Price*0.9998)
-	snap.HTFAligned = envBool("SIM_HTF_ALIGNED", true)
-	snap.ProfileReady = envBool("SIM_PROFILE_READY", true)
-	snap.TapeReady = envBool("SIM_TAPE_READY", true)
 	summary.SessionPrimary = snap.SessionContext.PrimarySession
 	summary.SessionPhase = snap.SessionContext.Phase
 	summary.SessionTags = append(summary.SessionTags, snap.SessionContext.Tags...)
@@ -550,7 +626,7 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 
 	comp := strategycore.NewCompiler(envInt("STRATEGY_MIN_CONFIDENCE_PAPER", 90))
 	cfg := loadRouterConfigFromEnv()
-	statuses := collectVenueStatusForPaper()
+	statuses := collectVenueStatusForPaper(symbol)
 	engine := replay.NewEngine(replay.FillModel{
 		SlippageBps: envFloat("PAPER_SLIPPAGE_BPS", 2.0),
 		FeeBps:      envFloat("PAPER_FEE_BPS", 3.5),
@@ -635,6 +711,11 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 			}}
 			res := engine.ExecutePlan(venuePlan)
 			summary.EstCost += res.TotalNetCost
+			fillState := "accepted"
+			if len(res.Executions) > 0 {
+				fillState = string(res.Executions[0].OrderState)
+			}
+			summary.FillEvents = append(summary.FillEvents, fmt.Sprintf("%s:%s/%s", a.Venue, fillState, formatMoney(venueNotional)))
 			notifyBestEffort(notifier, "paper_exec", fmt.Sprintf("setup=%s venue=%s accepted=%t total_notional=%.4f total_net_cost=%.4f", candidate.intent.Setup, a.Venue, res.Accepted, res.TotalNotional, res.TotalNetCost))
 			opened, err := paper.OnSignal(candidate.intent, string(a.Venue), snap.Price, time.Now().UTC(), venueNotional, targetLev)
 			if err != nil {
@@ -677,8 +758,10 @@ func summarizePaperStatus(paper *replay.PaperTrader, symbol string, mark float64
 	openPositions := paper.OpenPositions()
 	positions := make([]paperPositionView, 0, len(openPositions))
 	venueBalances := make(map[string]float64, len(st.VenueBalances))
+	venueStats := make(map[string]venuePaperSummary, len(st.VenueBalances))
 	for venue, bal := range st.VenueBalances {
 		venueBalances[venue] = bal
+		venueStats[venue] = venuePaperSummary{Balance: bal}
 	}
 	for _, p := range openPositions {
 		if p == nil {
@@ -698,8 +781,12 @@ func summarizePaperStatus(paper *replay.PaperTrader, symbol string, mark float64
 			positionPct = pctOf(positionUnreal, p.NotionalUSD)
 		}
 		unreal += positionUnreal
+		vs := venueStats[p.Venue]
+		vs.Open++
+		vs.Unrealized += positionUnreal
+		venueStats[p.Venue] = vs
 		positions = append(positions, paperPositionView{
-			Symbol:  p.Symbol,
+			Symbol:  nativeVenueSymbol(p.Symbol, p.Venue),
 			Setup:   compactSetupLabel(p.Setup),
 			Venue:   p.Venue,
 			Side:    strings.ToUpper(strings.TrimSpace(p.Side)),
@@ -709,6 +796,16 @@ func summarizePaperStatus(paper *replay.PaperTrader, symbol string, mark float64
 			PnlPct:  fmt.Sprintf("%.2f%%", positionPct),
 			PnlUSD:  signedMoney(positionUnreal),
 		})
+	}
+	for _, tr := range st.Trades {
+		vs := venueStats[tr.Venue]
+		vs.Realized += tr.PnlUSD
+		venueStats[tr.Venue] = vs
+	}
+	for venue, count := range runtimeDashboard.WatchCountsByVenue() {
+		vs := venueStats[venue]
+		vs.Watched = count
+		venueStats[venue] = vs
 	}
 	return paperStatusSummary{
 		OpenPositions: len(st.Positions),
@@ -720,6 +817,7 @@ func summarizePaperStatus(paper *replay.PaperTrader, symbol string, mark float64
 		ClosedTrades:  len(st.Trades),
 		VenueBalances: venueBalances,
 		Positions:     positions,
+		VenueStats:    venueStats,
 	}
 }
 
@@ -753,6 +851,7 @@ type cycleSummary struct {
 	HLWatchlist      []watchlistView
 	AsterWatchlist   []watchlistView
 	LighterWatchlist []watchlistView
+	FillEvents       []string
 }
 
 type paperStatusSummary struct {
@@ -765,6 +864,15 @@ type paperStatusSummary struct {
 	ClosedTrades  int
 	VenueBalances map[string]float64
 	Positions     []paperPositionView
+	VenueStats    map[string]venuePaperSummary
+}
+
+type venuePaperSummary struct {
+	Watched    int
+	Open       int
+	Realized   float64
+	Unrealized float64
+	Balance    float64
 }
 
 type paperPositionView struct {
@@ -783,13 +891,16 @@ func printCycleSummary(s cycleSummary) {
 	lines := []string{
 		fmt.Sprintf("Cycle      %s", s.Timestamp.Format("15:04:05Z")),
 		fmt.Sprintf("Session    %-18s phase=%-8s us_open=%t", s.SessionPrimary, s.SessionPhase, s.IsUSOpen),
-		fmt.Sprintf("Market     symbol=%s  mode=PAPER||LIVE  venue=%s", s.Symbol, s.LiveVenue),
+		fmt.Sprintf("Market     canonical=%s  live_path=%s", s.Symbol, s.LiveVenue),
 		fmt.Sprintf("Account    open_utc=%s  day_open=%s  mark=%s", s.DayUTCOpen.Format("15:04"), formatPx(s.DayOpen), formatPx(s.Mark)),
 		fmt.Sprintf("Balances   %s", formatVenueBalances(s.Paper.VenueBalances)),
 		fmt.Sprintf("Fair Value vwap=%s  avwap=%s  state=%s  conf=%d", formatPx(s.VWAP), formatPx(s.AVWAP), s.State, s.Confidence),
 		fmt.Sprintf("Routing    setups=%d  entries=%d  exits=%d  rejects=%d/%d  cost=%s", len(s.AcceptedSetups), len(s.Entries), len(s.Exits), s.StrategyRejects, s.RouteRejects, formatMoney(s.EstCost)),
 		fmt.Sprintf("Split      %s", formatRouteSplit(s.RouteSplit)),
 		fmt.Sprintf("Paper      open=%d  trades=%d  bal=%s  real=%s  unrl=%s", s.Paper.OpenPositions, s.Paper.ClosedTrades, formatMoney(s.Paper.Balance), plainPNL(s.Paper.Realized, s.Paper.RealizedPct), plainPNL(s.Paper.Unrealized, s.Paper.UnrealizedPct)),
+	}
+	if len(s.FillEvents) > 0 {
+		lines = append(lines, fmt.Sprintf("Fills      %s", condenseList(s.FillEvents, 3)))
 	}
 	if len(s.AcceptedSetups) > 0 {
 		lines = append(lines, fmt.Sprintf("Used       %s", condenseListPretty(s.AcceptedSetups, 4)))
@@ -809,6 +920,9 @@ func printCycleSummary(s cycleSummary) {
 	if len(s.TopSetups) > 0 {
 		lines = append(lines, fmt.Sprintf("Top Setups %s", strings.Join(s.TopSetups, "  |  ")))
 	}
+	if venueLine := formatVenueSummary(s.Paper); venueLine != "" {
+		lines = append(lines, fmt.Sprintf("Venues     %s", venueLine))
+	}
 	printPanel("VWAP SCALPER PAPER || LIVE", lines)
 	if len(s.Paper.Positions) > 0 {
 		rows := make([][]string, 0, len(s.Paper.Positions))
@@ -820,28 +934,28 @@ func printCycleSummary(s cycleSummary) {
 	if len(s.Watchlist) > 0 {
 		rows := make([][]string, 0, len(s.Watchlist))
 		for _, w := range s.Watchlist {
-			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, w.Venue, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), nativeVenueSymbol(w.Symbol, w.Venue), w.Venue, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
 		}
 		printTable("WATCHLIST | GLOBAL BEST", []string{"rank", "symbol", "venue", "price", "score", "grade", "why"}, rows)
 	}
 	if len(s.HLWatchlist) > 0 {
 		rows := make([][]string, 0, len(s.HLWatchlist))
 		for _, w := range s.HLWatchlist {
-			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), nativeVenueSymbol(w.Symbol, w.Venue), formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
 		}
 		printTable("TOP 10 | HYPERLIQUID", []string{"rank", "symbol", "price", "score", "grade", "why"}, rows)
 	}
 	if len(s.AsterWatchlist) > 0 {
 		rows := make([][]string, 0, len(s.AsterWatchlist))
 		for _, w := range s.AsterWatchlist {
-			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), nativeVenueSymbol(w.Symbol, w.Venue), formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
 		}
 		printTable("TOP 10 | ASTER", []string{"rank", "symbol", "price", "score", "grade", "why"}, rows)
 	}
 	if len(s.LighterWatchlist) > 0 {
 		rows := make([][]string, 0, len(s.LighterWatchlist))
 		for _, w := range s.LighterWatchlist {
-			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), nativeVenueSymbol(w.Symbol, w.Venue), formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
 		}
 		printTable("TOP 10 | LIGHTER", []string{"rank", "symbol", "price", "score", "grade", "why"}, rows)
 	}
@@ -1080,6 +1194,14 @@ func (d *runtimeDashboardState) TopWatchlistByVenue(venue string, limit int) []w
 	return d.topWatchlistFiltered(venue, limit)
 }
 
+func (d *runtimeDashboardState) WatchCountsByVenue() map[string]int {
+	out := map[string]int{}
+	for _, row := range d.watchlist {
+		out[row.Venue]++
+	}
+	return out
+}
+
 func (d *runtimeDashboardState) topWatchlistFiltered(venue string, limit int) []watchlistView {
 	venue = strings.ToLower(strings.TrimSpace(venue))
 	rows := make([]watchlistView, 0, len(d.watchlist))
@@ -1133,6 +1255,31 @@ func formatVenueBalances(balances map[string]float64) string {
 	return strings.Join(parts, "  ")
 }
 
+func formatVenueSummary(paper paperStatusSummary) string {
+	if len(paper.VenueStats) == 0 {
+		return ""
+	}
+	order := []string{"hyperliquid", "aster", "lighter"}
+	parts := make([]string, 0, len(order))
+	for _, venue := range order {
+		vs, ok := paper.VenueStats[venue]
+		if !ok {
+			continue
+		}
+		label := venue
+		switch venue {
+		case "hyperliquid":
+			label = "HL"
+		case "aster":
+			label = "ASTER"
+		case "lighter":
+			label = "LIGHTER"
+		}
+		parts = append(parts, fmt.Sprintf("%s w:%d o:%d r:%s u:%s", label, vs.Watched, vs.Open, signedMoney(vs.Realized), signedMoney(vs.Unrealized)))
+	}
+	return strings.Join(parts, " | ")
+}
+
 func signedMoney(v float64) string {
 	if v > 0 {
 		return "+" + formatMoney(v)
@@ -1142,17 +1289,17 @@ func signedMoney(v float64) string {
 
 func watchlistGrade(score int) string {
 	switch {
-	case score >= 95:
+	case score >= 92:
 		return "A+"
-	case score >= 90:
+	case score >= 86:
 		return "A"
-	case score >= 85:
-		return "A-"
 	case score >= 80:
+		return "A-"
+	case score >= 72:
 		return "B"
-	case score >= 70:
+	case score >= 64:
 		return "C"
-	case score >= 60:
+	case score >= 56:
 		return "D"
 	default:
 		return "F"
@@ -1160,89 +1307,91 @@ func watchlistGrade(score int) string {
 }
 
 func watchlistScore(state models.StateSignal, setup string, snap marketstate.Snapshot, venue string) int {
-	score := state.ConfidenceScore
+	score := int(math.Round(float64(state.ConfidenceScore) * 0.55))
 
 	switch state.State {
 	case models.StateCompression:
-		score += 8
+		score += 6
 	case models.StateExpansion:
-		score -= 6
+		score += 2
 	case models.StateChop:
-		score -= 12
+		score -= 14
 	}
 
 	switch snap.SessionContext.PrimarySession {
 	case "US_OPEN":
-		score += 8
+		score += 7
 	case "LONDON_US_OVERLAP":
-		score += 6
+		score += 5
 	case "LONDON":
-		score += 4
-	case "ASIA":
 		score += 2
+	case "ASIA":
+		score += 1
 	case "OFF_HOURS":
-		score -= 15
+		score -= 10
 	}
 
 	if snap.SessionContext.IsUSOpen {
-		score += 3
+		score += 2
 	}
 	if snap.HTFAligned {
-		score += 4
+		score += 3
 	}
 	if snap.ProfileReady {
-		score += 3
+		score += 2
 	}
 	if snap.TapeReady {
-		score += 3
+		score += 2
 	}
 	if snap.VolumeRatio >= 1.25 {
-		score += 5
+		score += 4
 	} else if snap.VolumeRatio < 0.9 {
-		score -= 4
+		score -= 5
 	}
 	if snap.ATRRatio >= 0.4 && snap.ATRRatio <= 1.2 {
-		score += 3
+		score += 2
+	} else if snap.ATRRatio > 1.8 {
+		score -= 4
 	}
 	if math.Abs(snap.DeltaFlipStrength) >= 0.35 {
-		score += 4
+		score += 3
 	}
 	if snap.DayOpenPrice > 0 && snap.Price > 0 {
 		dayMoveBps := math.Abs((snap.Price-snap.DayOpenPrice)/snap.DayOpenPrice) * 10000.0
 		if dayMoveBps <= 120 {
-			score += 2
+			score += 1
 		} else if dayMoveBps >= 400 {
-			score -= 5
+			score -= 6
 		}
 	}
 
 	switch strings.ToUpper(strings.TrimSpace(setup)) {
 	case "VWAP_HYBRID_CONFLUENCE":
-		score += 8
+		score += 4
 	case "VWAP_OPENING_DRIVE", "VWAP_BREAKOUT_CONTINUATION":
 		if snap.SessionContext.IsUSOpen || snap.SessionContext.PrimarySession == "LONDON_US_OVERLAP" {
-			score += 6
+			score += 4
 		} else {
-			score -= 2
+			score -= 3
 		}
 	case "VWAP_REJECTION_CONTINUATION", "VWAP_PULLBACK_IN_TREND", "VWAP_EMA_TREND_FUSION":
-		score += 4
-	case "ANCHORED_VWAP_REVERSION", "VWAP_DEVIATION_BAND_REVERSION", "VWAP_DOUBLE_TAP_REVERSAL":
 		score += 2
+	case "ANCHORED_VWAP_REVERSION", "VWAP_DEVIATION_BAND_REVERSION", "VWAP_DOUBLE_TAP_REVERSAL":
+		score += 1
 	}
 
 	switch strings.ToLower(strings.TrimSpace(venue)) {
 	case "hyperliquid":
-		score += 3
-	case "aster":
-		score += 2
-	case "lighter":
 		score += 1
+	case "aster":
+		score += 1
+	case "lighter":
+		score += 0
 	}
-	score += int(math.Round(venueScore(strings.ToLower(strings.TrimSpace(venue))) * 2))
+	score += int(math.Round((venueScore(strings.ToLower(strings.TrimSpace(venue))) - 1.0) * 3))
 
-	if score > 99 {
-		score = 99
+	if score > 96 {
+		score = 96
 	}
 	if score < 0 {
 		score = 0
@@ -1451,7 +1600,7 @@ func loadRouterConfigFromEnv() router.Config {
 	return cfg
 }
 
-func collectVenueStatusForPaper() []router.VenueStatus {
+func collectVenueStatusForPaper(symbol string) []router.VenueStatus {
 	type v struct {
 		name  string
 		venue models.Venue
@@ -1463,6 +1612,9 @@ func collectVenueStatusForPaper() []router.VenueStatus {
 	}
 	out := make([]router.VenueStatus, 0, len(all))
 	for _, it := range all {
+		if !paperVenueSymbols.Has(symbol, it.name) {
+			continue
+		}
 		rd := accountstream.ProbeReadiness(it.name)
 		wsr := accountstream.ProbeConnectivity(it.name)
 		s := router.VenueStatus{

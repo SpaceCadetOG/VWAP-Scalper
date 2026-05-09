@@ -51,11 +51,13 @@ type PaperState struct {
 }
 
 type TraderConfig struct {
-	StateFile      string
-	StartBalance   float64
-	StopPct        float64
-	TakeProfitPct  float64
-	MaxHoldSeconds int
+	StateFile       string
+	StartBalance    float64
+	StopPct         float64
+	TakeProfitPct   float64
+	MaxHoldSeconds  int
+	MaxOpenPerVenue int
+	MaxOpenTotal    int
 }
 
 type PaperTrader struct {
@@ -78,6 +80,12 @@ func NewPaperTrader(cfg TraderConfig) *PaperTrader {
 	}
 	if cfg.MaxHoldSeconds <= 0 {
 		cfg.MaxHoldSeconds = 180
+	}
+	if cfg.MaxOpenPerVenue <= 0 {
+		cfg.MaxOpenPerVenue = 8
+	}
+	if cfg.MaxOpenTotal <= 0 {
+		cfg.MaxOpenTotal = 18
 	}
 	p := &PaperTrader{cfg: cfg}
 	_ = p.load()
@@ -128,6 +136,12 @@ func (p *PaperTrader) OnSignal(intent router.Intent, venue string, price float64
 	available := p.state.VenueBalances[venue]
 	if marginRequired > available {
 		return false, fmt.Errorf("no paper balance for venue=%s available=%.4f required=%.4f", venue, available, marginRequired)
+	}
+	if p.countOpenForVenue(venue) >= p.cfg.MaxOpenPerVenue {
+		return false, fmt.Errorf("venue open position cap reached venue=%s cap=%d", venue, p.cfg.MaxOpenPerVenue)
+	}
+	if len(p.state.Positions) >= p.cfg.MaxOpenTotal {
+		return false, fmt.Errorf("global open position cap reached cap=%d", p.cfg.MaxOpenTotal)
 	}
 	qty := notional / price
 	pos := &PaperPosition{
@@ -391,4 +405,18 @@ func (p *PaperTrader) recalculateBalance() {
 		total += pos.MarginUsed
 	}
 	p.state.BalanceUSD = total
+}
+
+func (p *PaperTrader) countOpenForVenue(venue string) int {
+	venue = normalizeVenue(venue)
+	n := 0
+	for _, pos := range p.state.Positions {
+		if pos == nil {
+			continue
+		}
+		if normalizeVenue(pos.Venue) == venue {
+			n++
+		}
+	}
+	return n
 }
