@@ -2,6 +2,8 @@ package marketstate
 
 import (
 	"math"
+	"os"
+	"strings"
 
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/models"
 )
@@ -11,6 +13,11 @@ type Snapshot struct {
 	Price             float64
 	SessionVWAP       float64
 	AnchoredVWAP      float64
+	EMA9              float64
+	EMA20             float64
+	HTFAligned        bool
+	ProfileReady      bool
+	TapeReady         bool
 	ATRRatio          float64
 	VolumeRatio       float64
 	Delta             float64
@@ -23,6 +30,17 @@ type Detector struct{}
 func NewDetector() *Detector { return &Detector{} }
 
 func (d *Detector) Detect(s Snapshot) models.StateSignal {
+	toolingReady := s.HTFAligned && s.ProfileReady && s.TapeReady && s.EMA9 > 0 && s.EMA20 > 0
+	strictGate := strings.EqualFold(strings.TrimSpace(os.Getenv("CHAPTER3_STRICT_GATE")), "true")
+	if strictGate && !toolingReady {
+		return models.StateSignal{
+			State:           models.StateChop,
+			ConfidenceScore: 0,
+			Invalidators:    []string{"chapter3_toolstack_not_ready"},
+			ExpiryMs:        1000,
+		}
+	}
+
 	if s.SessionVWAP <= 0 || s.Price <= 0 {
 		return models.StateSignal{
 			State:           models.StateChop,
@@ -44,13 +62,20 @@ func (d *Detector) Detect(s Snapshot) models.StateSignal {
 		if lowVol {
 			score += 5
 		}
+		if !toolingReady {
+			score -= 12
+		}
 		if score > 100 {
 			score = 100
+		}
+		invalidators := []string{}
+		if !toolingReady {
+			invalidators = append(invalidators, "chapter3_toolstack_not_ready")
 		}
 		return models.StateSignal{
 			State:           models.StateCompression,
 			ConfidenceScore: score,
-			Invalidators:    []string{},
+			Invalidators:    invalidators,
 			ExpiryMs:        180000,
 		}
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	accountstream "github.com/SpaceCadetOG/VWAP-Scalper/internal/adapters/accountstream"
@@ -38,6 +40,7 @@ func main() {
 	checkAccountStreams := flag.Bool("check-account-streams", false, "run account stream readiness/connectivity checks (Step 7)")
 	paperRoute := flag.Bool("paper-route", false, "run Step 9 paper/replay routing simulation (no live orders)")
 	paperE2E := flag.Bool("paper-e2e", false, "run strategycore+marketstate+router+paper end-to-end simulation")
+	paperDaemon := flag.Bool("paper-daemon", false, "run continuous paper e2e loop (for separate tab/window)")
 	testTrade := flag.Bool("test-trade", false, "place a small live test trade and collect order/fill details")
 	testOrderTypes := flag.Bool("test-order-types", false, "place/cancel small Aster order-type smoke tests")
 	testBatch := flag.Bool("test-batch", false, "run live batch-order smoke tests")
@@ -66,6 +69,10 @@ func main() {
 	}
 	if *paperE2E {
 		runPaperE2E(strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
+		return
+	}
+	if *paperDaemon {
+		runPaperDaemon(strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
 		return
 	}
 
@@ -146,12 +153,57 @@ func runPaperRoute(symbol string, notionalUSD float64) {
 }
 
 func runPaperE2E(symbol string, notionalUSD float64) {
+	if _, err := runPaperE2EOnce(symbol, notionalUSD); err != nil {
+		fmt.Printf("paper_e2e_failed err=%v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runPaperDaemon(symbol string, notionalUSD float64) {
+	intervalSec := envInt("PAPER_DAEMON_INTERVAL_SEC", 30)
+	if intervalSec < 5 {
+		intervalSec = 5
+	}
+	fmt.Printf("paper_daemon_start symbol=%s notional=%.4f interval_sec=%d\n", symbol, notionalUSD, intervalSec)
+	fmt.Println("paper_daemon_controls: press 'y' then Enter to promote next valid signal to live")
+	var promoteRequested int32
+	go func() {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			line := strings.TrimSpace(strings.ToLower(sc.Text()))
+			if line == "y" {
+				atomic.StoreInt32(&promoteRequested, 1)
+				fmt.Println("paper_daemon_promotion armed=true (next valid cycle will go live)")
+			}
+		}
+	}()
+	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
+	defer ticker.Stop()
+	for {
+		intent, err := runPaperE2EOnce(symbol, notionalUSD)
+		if err != nil {
+			fmt.Printf("paper_daemon_cycle_error err=%v\n", err)
+		} else if atomic.LoadInt32(&promoteRequested) == 1 {
+			atomic.StoreInt32(&promoteRequested, 0)
+			fmt.Printf("paper_to_live_promotion signal_id=%s side=%s pair=%s\n", intent.SignalID, intent.Side, intent.CanonicalPair)
+			runLivePromotion(intent, symbol)
+		}
+		<-ticker.C
+	}
+}
+
+func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) {
 	fmt.Println("=== STEP 11 PAPER E2E ===")
 	notifier := observability.NewNotifierFromEnv()
 	snap := marketstate.Snapshot{
 		Price:             envFloat("SIM_PRICE", 43000),
 		SessionVWAP:       envFloat("SIM_SESSION_VWAP", 42990),
 		AnchoredVWAP:      envFloat("SIM_ANCHORED_VWAP", 42992),
+		EMA9:              envFloat("SIM_EMA9", 43010),
+		EMA20:             envFloat("SIM_EMA20", 42980),
+		HTFAligned:        envBool("SIM_HTF_ALIGNED", true),
+		ProfileReady:      envBool("SIM_PROFILE_READY", true),
+		TapeReady:         envBool("SIM_TAPE_READY", true),
 		ATRRatio:          envFloat("SIM_ATR_RATIO", 0.75),
 		VolumeRatio:       envFloat("SIM_VOLUME_RATIO", 1.2),
 		Delta:             envFloat("SIM_DELTA", 0.3),
@@ -189,7 +241,7 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 	if err != nil {
 		fmt.Printf("strategy_intent_rejected err=%v\n", err)
 		notifyBestEffort(notifier, "strategy_reject", fmt.Sprintf("symbol=%s err=%v", symbol, err))
-		os.Exit(1)
+		return router.Intent{}, err
 	}
 	fmt.Printf("strategy_intent signal_id=%s setup=%s side=%s pair=%s notional_usd=%.4f\n",
 		intent.SignalID, intent.Setup, intent.Side, intent.CanonicalPair, intent.NotionalUSD)
@@ -204,7 +256,7 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 		for _, r := range plan.Rejected {
 			fmt.Printf("venue_reject venue=%s reason=%s detail=%s\n", r.Venue, r.Reason, r.Detail)
 		}
-		os.Exit(1)
+		return intent, fmt.Errorf("router rejected: %s", plan.Reason)
 	}
 
 	fmt.Printf("router_plan_accepted allocations=%d\n", len(plan.Allocations))
@@ -226,6 +278,14 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 			ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost, ex.LatencyMs)
 		notifyBestEffort(notifier, "paper_fill", fmt.Sprintf("venue=%s state=%s notional=%.4f fee=%.4f slip=%.4f", ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost))
 	}
+	return intent, nil
+}
+
+func runLivePromotion(intent router.Intent, symbol string) {
+	venue := strings.ToLower(strings.TrimSpace(envString("PAPER_PROMOTE_LIVE_VENUE", "hyperliquid")))
+	liveNotional := envFloat("PAPER_PROMOTE_LIVE_NOTIONAL_USD", intent.NotionalUSD)
+	fmt.Printf("live_promotion_execute venue=%s symbol=%s notional_usd=%.4f\n", venue, symbol, liveNotional)
+	runTestTrade(venue, symbol, liveNotional)
 }
 
 func notifyBestEffort(n *observability.Notifier, event, msg string) {
