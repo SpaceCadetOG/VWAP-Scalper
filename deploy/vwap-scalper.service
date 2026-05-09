@@ -1,0 +1,19 @@
+[Unit]
+Description=VWAP Scalper Live-Lite Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/vwap-scalper
+EnvironmentFile=/opt/vwap-scalper/.env
+ExecStart=/opt/vwap-scalper/vwap-live --start
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/vwap-scalper/out/live.log
+StandardError=append:/opt/vwap-scalper/out/live.err.log
+
+[Install]
+WantedBy=multi-user.target
+

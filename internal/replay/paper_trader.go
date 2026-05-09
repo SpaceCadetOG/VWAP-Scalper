@@ -13,6 +13,7 @@ import (
 
 type PaperPosition struct {
 	Symbol      string    `json:"symbol"`
+	Venue       string    `json:"venue"`
 	Side        string    `json:"side"`
 	EntryPrice  float64   `json:"entry_price"`
 	NotionalUSD float64   `json:"notional_usd"`
@@ -22,6 +23,7 @@ type PaperPosition struct {
 
 type PaperTrade struct {
 	Symbol      string    `json:"symbol"`
+	Venue       string    `json:"venue"`
 	Side        string    `json:"side"`
 	EntryPrice  float64   `json:"entry_price"`
 	ExitPrice   float64   `json:"exit_price"`
@@ -81,7 +83,7 @@ func NewPaperTrader(cfg TraderConfig) *PaperTrader {
 
 func (p *PaperTrader) State() PaperState { return p.state }
 
-func (p *PaperTrader) OnSignal(intent router.Intent, price float64, now time.Time) error {
+func (p *PaperTrader) OnSignal(intent router.Intent, venue string, price float64, now time.Time) error {
 	sym := strings.ToUpper(strings.TrimSpace(intent.CanonicalPair))
 	if sym == "" || price <= 0 {
 		return fmt.Errorf("invalid signal/price")
@@ -99,6 +101,7 @@ func (p *PaperTrader) OnSignal(intent router.Intent, price float64, now time.Tim
 	qty := notional / price
 	pos := &PaperPosition{
 		Symbol:      sym,
+		Venue:       strings.ToLower(strings.TrimSpace(venue)),
 		Side:        strings.ToLower(string(intent.Side)),
 		EntryPrice:  price,
 		NotionalUSD: notional,
@@ -148,6 +151,7 @@ func (p *PaperTrader) Mark(symbol string, price float64, now time.Time) *PaperTr
 	p.state.BalanceUSD += pnl
 	tr := PaperTrade{
 		Symbol:      pos.Symbol,
+		Venue:       pos.Venue,
 		Side:        pos.Side,
 		EntryPrice:  pos.EntryPrice,
 		ExitPrice:   price,

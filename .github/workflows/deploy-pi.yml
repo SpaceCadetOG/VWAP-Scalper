@@ -1,0 +1,47 @@
+name: deploy-pi
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build linux arm64 binary
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o dist/vwap-live ./cmd/live
+
+      - name: Upload binary to Raspberry Pi
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PI_HOST }}
+          username: ${{ secrets.PI_USER }}
+          key: ${{ secrets.PI_SSH_KEY }}
+          source: "dist/vwap-live"
+          target: "${{ secrets.PI_APP_DIR }}"
+
+      - name: Restart bot service on Pi
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PI_HOST }}
+          username: ${{ secrets.PI_USER }}
+          key: ${{ secrets.PI_SSH_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.PI_APP_DIR }}"
+            sudo install -m 0755 "$APP_DIR/dist/vwap-live" "$APP_DIR/vwap-live"
+            sudo systemctl daemon-reload
+            sudo systemctl restart vwap-scalper.service
+            sudo systemctl status vwap-scalper.service --no-pager -l | head -n 40
+

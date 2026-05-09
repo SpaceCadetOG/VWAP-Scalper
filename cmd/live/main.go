@@ -173,7 +173,8 @@ func runPaperDaemon(symbols []string, notionalUSD float64) {
 		intervalSec = 5
 	}
 	liveVenue := strings.ToLower(strings.TrimSpace(envString("PAPER_PROMOTE_LIVE_VENUE", "hyperliquid")))
-	fmt.Printf("CONFIG symbols=%s notional=%.4f interval_sec=%d mode=paper live_venue=%s\n", strings.Join(symbols, ","), notionalUSD, intervalSec, liveVenue)
+	targetLev := envInt("BOT_TARGET_LEVERAGE", 10)
+	fmt.Printf("CONFIG symbols=%s notional=%.4f interval_sec=%d mode=paper live_venue=%s target_lev=%dx\n", strings.Join(symbols, ","), notionalUSD, intervalSec, liveVenue, targetLev)
 	fmt.Println("CONFIG controls: promote_next_live='y' + Enter")
 	autoPromote := envBool("PAPER_AUTO_PROMOTE_LIVE", false)
 	if autoPromote {
