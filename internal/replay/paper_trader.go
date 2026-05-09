@@ -109,7 +109,8 @@ func (p *PaperTrader) OnSignal(intent router.Intent, venue string, price float64
 		return false, fmt.Errorf("invalid signal/price")
 	}
 	setup := normalizeSetup(intent.Setup)
-	key := paperPositionKey(sym, setup)
+	venue = normalizeVenue(venue)
+	key := paperPositionKey(sym, setup, venue)
 	if _, exists := p.state.Positions[key]; exists {
 		return false, nil
 	}
@@ -120,7 +121,6 @@ func (p *PaperTrader) OnSignal(intent router.Intent, venue string, price float64
 	if notional <= 0 {
 		return false, fmt.Errorf("no paper balance")
 	}
-	venue = normalizeVenue(venue)
 	if leverage <= 0 {
 		leverage = 1
 	}
@@ -322,7 +322,7 @@ func (p *PaperTrader) normalizeState() {
 		if pos.MarginUsed <= 0 && pos.NotionalUSD > 0 {
 			pos.MarginUsed = pos.NotionalUSD / float64(pos.Leverage)
 		}
-		normKey := paperPositionKey(pos.Symbol, pos.Setup)
+		normKey := paperPositionKey(pos.Symbol, pos.Setup, pos.Venue)
 		if strings.TrimSpace(key) == "" {
 			key = normKey
 		}
@@ -355,8 +355,8 @@ func normalizeSetup(setup string) string {
 	return setup
 }
 
-func paperPositionKey(symbol, setup string) string {
-	return strings.ToUpper(strings.TrimSpace(symbol)) + "|" + normalizeSetup(setup)
+func paperPositionKey(symbol, setup, venue string) string {
+	return strings.ToUpper(strings.TrimSpace(symbol)) + "|" + normalizeSetup(setup) + "|" + normalizeVenue(venue)
 }
 
 func normalizeVenue(venue string) string {

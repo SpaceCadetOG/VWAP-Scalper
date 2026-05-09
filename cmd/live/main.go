@@ -488,10 +488,18 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 		LiveVenue:  liveVenue,
 		RouteSplit: map[string]float64{},
 	}
+	paper := replay.NewPaperTrader(replay.TraderConfig{
+		StateFile:      envString("PAPER_STATE_FILE", "out/paper_state.json"),
+		StartBalance:   envFloat("PAPER_START_BALANCE", 100),
+		StopPct:        envFloat("PAPER_STOP_PCT", 0.006),
+		TakeProfitPct:  envFloat("PAPER_TP_PCT", 0.009),
+		MaxHoldSeconds: envInt("PAPER_MAX_HOLD_SEC", 180),
+	})
 	notifier := observability.NewNotifierFromEnv()
 	if !envBool("SIM_USE_LIVE_SNAPSHOT", true) {
 		err := fmt.Errorf("SIM_USE_LIVE_SNAPSHOT must be true (no placeholder mode)")
 		summary.Errors = append(summary.Errors, err.Error())
+		summary.Paper = summarizePaperStatus(paper, symbol, 0)
 		printCycleSummary(summary)
 		return router.Intent{}, nil, err
 	}
@@ -503,6 +511,7 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 	if err != nil {
 		err = fmt.Errorf("live snapshot required: %w", err)
 		summary.Errors = append(summary.Errors, err.Error())
+		summary.Paper = summarizePaperStatus(paper, symbol, 0)
 		printCycleSummary(summary)
 		return router.Intent{}, nil, err
 	}
@@ -521,13 +530,6 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 	summary.VWAP = snap.SessionVWAP
 	summary.AVWAP = snap.AnchoredVWAP
 
-	paper := replay.NewPaperTrader(replay.TraderConfig{
-		StateFile:      envString("PAPER_STATE_FILE", "out/paper_state.json"),
-		StartBalance:   envFloat("PAPER_START_BALANCE", 100),
-		StopPct:        envFloat("PAPER_STOP_PCT", 0.006),
-		TakeProfitPct:  envFloat("PAPER_TP_PCT", 0.009),
-		MaxHoldSeconds: envInt("PAPER_MAX_HOLD_SEC", 180),
-	})
 	for _, tr := range paper.MarkSymbol(symbol, snap.Price, time.Now().UTC()) {
 		pct := 0.0
 		if tr.NotionalUSD > 0 {

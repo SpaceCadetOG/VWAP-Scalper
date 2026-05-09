@@ -35,6 +35,34 @@ func TestPaperTraderTracksSetupsSeparately(t *testing.T) {
 	}
 }
 
+func TestPaperTraderTracksVenuesSeparatelyForSameSetup(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "paper_state.json")
+	trader := NewPaperTrader(TraderConfig{StateFile: stateFile, StartBalance: 100, StopPct: 0.01, TakeProfitPct: 0.02, MaxHoldSeconds: 60})
+	now := time.Unix(2_000, 0)
+	intent := router.Intent{CanonicalPair: "BTCUSDT", Setup: "VWAP_HYBRID_CONFLUENCE", Side: router.SideBuy, NotionalUSD: 10}
+
+	opened, err := trader.OnSignal(intent, "hyperliquid", 100, now, 10, 3)
+	if err != nil || !opened {
+		t.Fatalf("expected hyperliquid position to open, opened=%t err=%v", opened, err)
+	}
+	opened, err = trader.OnSignal(intent, "aster", 100, now, 10, 3)
+	if err != nil || !opened {
+		t.Fatalf("expected aster position to open independently, opened=%t err=%v", opened, err)
+	}
+	opened, err = trader.OnSignal(intent, "hyperliquid", 100, now, 10, 3)
+	if err != nil {
+		t.Fatalf("unexpected duplicate err=%v", err)
+	}
+	if opened {
+		t.Fatalf("expected duplicate same-venue position to be skipped")
+	}
+
+	positions := trader.OpenPositionsForSymbol("BTCUSDT")
+	if len(positions) != 2 {
+		t.Fatalf("expected 2 venue-specific positions, got %d", len(positions))
+	}
+}
+
 func TestPaperTraderMarksAllSetupsForSymbol(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "paper_state.json")
 	trader := NewPaperTrader(TraderConfig{StateFile: stateFile, StartBalance: 100, StopPct: 0.01, TakeProfitPct: 0.02, MaxHoldSeconds: 60})
