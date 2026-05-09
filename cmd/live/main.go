@@ -164,8 +164,8 @@ func runPaperDaemon(symbol string, notionalUSD float64) {
 	if intervalSec < 5 {
 		intervalSec = 5
 	}
-	fmt.Printf("paper_daemon_start symbol=%s notional=%.4f interval_sec=%d\n", symbol, notionalUSD, intervalSec)
-	fmt.Println("paper_daemon_controls: press 'y' then Enter to promote next valid signal to live")
+	fmt.Printf("live_lite_start symbol=%s notional=%.4f interval_sec=%d mode=paper\n", symbol, notionalUSD, intervalSec)
+	fmt.Println("live_lite_controls promote_next_live='y' + Enter")
 	var promoteRequested int32
 	go func() {
 		sc := bufio.NewScanner(os.Stdin)
@@ -173,7 +173,7 @@ func runPaperDaemon(symbol string, notionalUSD float64) {
 			line := strings.TrimSpace(strings.ToLower(sc.Text()))
 			if line == "y" {
 				atomic.StoreInt32(&promoteRequested, 1)
-				fmt.Println("paper_daemon_promotion armed=true (next valid cycle will go live)")
+				fmt.Println("live_lite_promotion armed=true")
 			}
 		}
 	}()
@@ -182,10 +182,10 @@ func runPaperDaemon(symbol string, notionalUSD float64) {
 	for {
 		intent, err := runPaperE2EOnce(symbol, notionalUSD)
 		if err != nil {
-			fmt.Printf("paper_daemon_cycle_error err=%v\n", err)
+			fmt.Printf("cycle_error err=%v\n", err)
 		} else if atomic.LoadInt32(&promoteRequested) == 1 {
 			atomic.StoreInt32(&promoteRequested, 0)
-			fmt.Printf("paper_to_live_promotion signal_id=%s side=%s pair=%s\n", intent.SignalID, intent.Side, intent.CanonicalPair)
+			fmt.Printf("promote_live signal_id=%s side=%s pair=%s\n", intent.SignalID, intent.Side, intent.CanonicalPair)
 			runLivePromotion(intent, symbol)
 		}
 		<-ticker.C
@@ -193,7 +193,8 @@ func runPaperDaemon(symbol string, notionalUSD float64) {
 }
 
 func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) {
-	fmt.Println("=== STEP 11 PAPER E2E ===")
+	now := time.Now().UTC()
+	fmt.Printf("cycle ts=%s symbol=%s\n", now.Format(time.RFC3339), symbol)
 	notifier := observability.NewNotifierFromEnv()
 	if !envBool("SIM_USE_LIVE_SNAPSHOT", true) {
 		return router.Intent{}, fmt.Errorf("SIM_USE_LIVE_SNAPSHOT must be true (no placeholder mode)")
@@ -211,7 +212,7 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 	snap.HTFAligned = envBool("SIM_HTF_ALIGNED", true)
 	snap.ProfileReady = envBool("SIM_PROFILE_READY", true)
 	snap.TapeReady = envBool("SIM_TAPE_READY", true)
-	fmt.Printf("live_snapshot_loaded price=%.6f session_vwap=%.6f anchored_vwap=%.6f\n", snap.Price, snap.SessionVWAP, snap.AnchoredVWAP)
+	fmt.Printf("market px=%.2f vwap=%.2f avwap=%.2f\n", snap.Price, snap.SessionVWAP, snap.AnchoredVWAP)
 
 	paper := replay.NewPaperTrader(replay.TraderConfig{
 		StateFile:      envString("PAPER_STATE_FILE", "out/paper_state.json"),
@@ -221,14 +222,13 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		MaxHoldSeconds: envInt("PAPER_MAX_HOLD_SEC", 180),
 	})
 	if tr := paper.Mark(symbol, snap.Price, time.Now().UTC()); tr != nil {
-		fmt.Printf("paper_exit symbol=%s side=%s reason=%s pnl_usd=%.4f balance_usd=%.4f\n", tr.Symbol, tr.Side, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD)
+		fmt.Printf("exit symbol=%s side=%s reason=%s pnl=%.4f balance=%.4f\n", tr.Symbol, tr.Side, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD)
 		notifyBestEffort(notifier, "paper_exit", fmt.Sprintf("symbol=%s reason=%s pnl=%.4f balance=%.4f", tr.Symbol, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD))
 	}
 
 	detector := marketstate.NewDetector()
 	state := detector.Detect(snap)
-	fmt.Printf("market_state state=%s confidence=%d invalidators=%v expiry_ms=%d\n",
-		state.State, state.ConfidenceScore, state.Invalidators, state.ExpiryMs)
+	fmt.Printf("state name=%s conf=%d expiry_ms=%d\n", state.State, state.ConfidenceScore, state.ExpiryMs)
 	notifyBestEffort(notifier, "market_state", fmt.Sprintf("symbol=%s state=%s confidence=%d", symbol, state.State, state.ConfidenceScore))
 
 	comp := strategycore.NewCompiler(envInt("STRATEGY_MIN_CONFIDENCE_PAPER", 70))
@@ -245,7 +245,7 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		notifyBestEffort(notifier, "strategy_reject", fmt.Sprintf("symbol=%s err=%v", symbol, err))
 		return router.Intent{}, err
 	}
-	fmt.Printf("strategy_intent signal_id=%s setup=%s side=%s pair=%s notional_usd=%.4f\n",
+	fmt.Printf("signal id=%s setup=%s side=%s pair=%s notional=%.4f\n",
 		intent.SignalID, intent.Setup, intent.Side, intent.CanonicalPair, intent.NotionalUSD)
 	notifyBestEffort(notifier, "strategy_intent", fmt.Sprintf("signal_id=%s side=%s pair=%s notional=%.4f", intent.SignalID, intent.Side, intent.CanonicalPair, intent.NotionalUSD))
 
@@ -261,10 +261,10 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		return intent, fmt.Errorf("router rejected: %s", plan.Reason)
 	}
 
-	fmt.Printf("router_plan_accepted allocations=%d\n", len(plan.Allocations))
+	fmt.Printf("route allocations=%d\n", len(plan.Allocations))
 	notifyBestEffort(notifier, "router_plan", fmt.Sprintf("accepted allocations=%d", len(plan.Allocations)))
 	for _, a := range plan.Allocations {
-		fmt.Printf("alloc venue=%s weight=%.4f notional_usd=%.4f\n", a.Venue, a.Weight, a.NotionalUSD)
+		fmt.Printf("route_preview venue=%s weight=%.3f notional=%.4f\n", a.Venue, a.Weight, a.NotionalUSD)
 	}
 
 	engine := replay.NewEngine(replay.FillModel{
@@ -273,18 +273,14 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		LatencyMs:   int64(envInt("PAPER_LATENCY_MS", 250)),
 	})
 	res := engine.ExecutePlan(plan)
-	fmt.Printf("paper_exec accepted=%t total_notional_usd=%.4f total_net_cost=%.4f\n", res.Accepted, res.TotalNotional, res.TotalNetCost)
+	fmt.Printf("exec accepted=%t total_notional=%.4f est_cost=%.4f\n", res.Accepted, res.TotalNotional, res.TotalNetCost)
 	notifyBestEffort(notifier, "paper_exec", fmt.Sprintf("accepted=%t total_notional=%.4f total_net_cost=%.4f", res.Accepted, res.TotalNotional, res.TotalNetCost))
-	for _, ex := range res.Executions {
-		fmt.Printf("paper_fill venue=%s state=%s notional_usd=%.4f fee_cost=%.4f slippage_cost=%.4f latency_ms=%d\n",
-			ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost, ex.LatencyMs)
-		notifyBestEffort(notifier, "paper_fill", fmt.Sprintf("venue=%s state=%s notional=%.4f fee=%.4f slip=%.4f", ex.Venue, ex.OrderState, ex.NotionalUSD, ex.FeeCost, ex.SlippageCost))
-	}
+	_ = res
 	if err := paper.OnSignal(intent, snap.Price, time.Now().UTC()); err != nil {
-		fmt.Printf("paper_entry_skip err=%v\n", err)
+		fmt.Printf("entry skip=%v\n", err)
 	} else {
 		st := paper.State()
-		fmt.Printf("paper_entry symbol=%s side=%s price=%.4f open_positions=%d balance_usd=%.4f\n", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD)
+		fmt.Printf("entry symbol=%s side=%s px=%.2f open=%d balance=%.4f trades=%d\n", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD, len(st.Trades))
 		notifyBestEffort(notifier, "paper_entry", fmt.Sprintf("symbol=%s side=%s price=%.4f open_positions=%d balance=%.4f", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD))
 	}
 	return intent, nil
