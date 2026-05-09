@@ -24,6 +24,7 @@ func BuildLiveSnapshot(cfg LiveSnapshotConfig, canonicalSymbol string) (Snapshot
 	}
 	client := &http.Client{Timeout: timeout}
 
+	dayOpenUTC := startOfUTCTradingDay(time.Now().UTC())
 	px, err := fetchAsterPrice(client, cfg.AsterBaseURL, canonicalSymbol)
 	if err != nil {
 		px, err = fetchHyperliquidPrice(client, cfg.HyperliquidBaseURL, canonicalSymbol)
@@ -31,9 +32,16 @@ func BuildLiveSnapshot(cfg LiveSnapshotConfig, canonicalSymbol string) (Snapshot
 			return Snapshot{}, fmt.Errorf("live snapshot price fetch failed: %w", err)
 		}
 	}
+	dayOpenPrice, dayOpenErr := fetchAsterDayOpenPrice(client, cfg.AsterBaseURL, canonicalSymbol)
+	if dayOpenErr != nil || dayOpenPrice <= 0 {
+		dayOpenPrice = px
+	}
 
 	// Conservative defaults until full WS-derived microstructure signals are wired.
 	return Snapshot{
+		DayUTCOpen:        dayOpenUTC,
+		DayOpenPrice:      dayOpenPrice,
+		SessionContext:    BuildSessionContext(time.Now().UTC()),
 		Price:             px,
 		SessionVWAP:       px * 0.9998,
 		AnchoredVWAP:      px * 0.9999,
@@ -67,6 +75,36 @@ func fetchAsterPrice(client *http.Client, baseURL, symbol string) (float64, erro
 		return 0, err
 	}
 	return strconv.ParseFloat(strings.TrimSpace(out.Price), 64)
+}
+
+func fetchAsterDayOpenPrice(client *http.Client, baseURL, symbol string) (float64, error) {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = "https://fapi.asterdex.com"
+	}
+	u := fmt.Sprintf("%s/fapi/v1/klines?symbol=%s&interval=1d&limit=1", base, strings.ToUpper(strings.TrimSpace(symbol)))
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return 0, fmt.Errorf("aster day open status=%d", resp.StatusCode)
+	}
+	var out [][]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return 0, err
+	}
+	if len(out) == 0 || len(out[0]) < 2 {
+		return 0, fmt.Errorf("aster day open missing kline")
+	}
+	rawOpen, ok := out[0][1].(string)
+	if !ok {
+		return 0, fmt.Errorf("aster day open invalid open format")
+	}
+	return strconv.ParseFloat(strings.TrimSpace(rawOpen), 64)
 }
 
 func fetchHyperliquidPrice(client *http.Client, baseURL, symbol string) (float64, error) {
@@ -109,4 +147,9 @@ func normalizeHyperliquidCoin(symbol string) string {
 	default:
 		return s
 	}
+}
+
+func startOfUTCTradingDay(now time.Time) time.Time {
+	now = now.UTC()
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 }

@@ -481,10 +481,19 @@ func dedupeSymbols(in []string) []string {
 func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []string, error) {
 	now := time.Now().UTC()
 	liveVenue := strings.ToLower(strings.TrimSpace(envString("PAPER_PROMOTE_LIVE_VENUE", "hyperliquid")))
-	fmt.Printf("\nCYCLE ts=%s symbol=%s live_venue=%s\n", now.Format(time.RFC3339), symbol, liveVenue)
+	targetLev := envInt("BOT_TARGET_LEVERAGE", 3)
+	summary := cycleSummary{
+		Timestamp:  now,
+		Symbol:     symbol,
+		LiveVenue:  liveVenue,
+		RouteSplit: map[string]float64{},
+	}
 	notifier := observability.NewNotifierFromEnv()
 	if !envBool("SIM_USE_LIVE_SNAPSHOT", true) {
-		return router.Intent{}, nil, fmt.Errorf("SIM_USE_LIVE_SNAPSHOT must be true (no placeholder mode)")
+		err := fmt.Errorf("SIM_USE_LIVE_SNAPSHOT must be true (no placeholder mode)")
+		summary.Errors = append(summary.Errors, err.Error())
+		printCycleSummary(summary)
+		return router.Intent{}, nil, err
 	}
 	snap, err := marketstate.BuildLiveSnapshot(marketstate.LiveSnapshotConfig{
 		HyperliquidBaseURL: envString("HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"),
@@ -492,124 +501,862 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, []strin
 		Timeout:            5 * time.Second,
 	}, symbol)
 	if err != nil {
-		return router.Intent{}, nil, fmt.Errorf("live snapshot required: %w", err)
+		err = fmt.Errorf("live snapshot required: %w", err)
+		summary.Errors = append(summary.Errors, err.Error())
+		printCycleSummary(summary)
+		return router.Intent{}, nil, err
 	}
 	snap.EMA9 = envFloat("SIM_EMA9", snap.Price*1.0002)
 	snap.EMA20 = envFloat("SIM_EMA20", snap.Price*0.9998)
 	snap.HTFAligned = envBool("SIM_HTF_ALIGNED", true)
 	snap.ProfileReady = envBool("SIM_PROFILE_READY", true)
 	snap.TapeReady = envBool("SIM_TAPE_READY", true)
-	fmt.Printf("ACCOUNT mark=%.2f vwap=%.2f avwap=%.2f\n", snap.Price, snap.SessionVWAP, snap.AnchoredVWAP)
+	summary.SessionPrimary = snap.SessionContext.PrimarySession
+	summary.SessionPhase = snap.SessionContext.Phase
+	summary.SessionTags = append(summary.SessionTags, snap.SessionContext.Tags...)
+	summary.IsUSOpen = snap.SessionContext.IsUSOpen
+	summary.DayUTCOpen = snap.DayUTCOpen
+	summary.DayOpen = snap.DayOpenPrice
+	summary.Mark = snap.Price
+	summary.VWAP = snap.SessionVWAP
+	summary.AVWAP = snap.AnchoredVWAP
 
 	paper := replay.NewPaperTrader(replay.TraderConfig{
 		StateFile:      envString("PAPER_STATE_FILE", "out/paper_state.json"),
-		StartBalance:   envFloat("PAPER_START_BALANCE", 1000),
+		StartBalance:   envFloat("PAPER_START_BALANCE", 100),
 		StopPct:        envFloat("PAPER_STOP_PCT", 0.006),
 		TakeProfitPct:  envFloat("PAPER_TP_PCT", 0.009),
 		MaxHoldSeconds: envInt("PAPER_MAX_HOLD_SEC", 180),
 	})
-	if tr := paper.Mark(symbol, snap.Price, time.Now().UTC()); tr != nil {
+	for _, tr := range paper.MarkSymbol(symbol, snap.Price, time.Now().UTC()) {
 		pct := 0.0
 		if tr.NotionalUSD > 0 {
 			pct = (tr.PnlUSD / tr.NotionalUSD) * 100.0
 		}
-		fmt.Printf("ACTION exit symbol=%s venue=%s side=%s reason=%s pnl=%s balance=%.4f\n",
-			tr.Symbol, tr.Venue, colorSide(tr.Side), tr.Reason, colorPNL(tr.PnlUSD, pct), paper.State().BalanceUSD)
-		notifyBestEffort(notifier, "paper_exit", fmt.Sprintf("symbol=%s reason=%s pnl=%.4f balance=%.4f", tr.Symbol, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD))
+		summary.Exits = append(summary.Exits, fmt.Sprintf("%s %s %s", tr.Setup, tr.Reason, plainPNL(tr.PnlUSD, pct)))
+		runtimeDashboard.NoteExit(tr)
+		notifyBestEffort(notifier, "paper_exit", fmt.Sprintf("symbol=%s setup=%s reason=%s pnl=%.4f balance=%.4f", tr.Symbol, tr.Setup, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD))
 	}
+	paper.UpdateMark(symbol, snap.Price)
 
 	detector := marketstate.NewDetector()
 	state := detector.Detect(snap)
-	fmt.Printf("PAPER state=%s conf=%d expiry_ms=%d\n", state.State, state.ConfidenceScore, state.ExpiryMs)
+	summary.State = string(state.State)
+	summary.Confidence = state.ConfidenceScore
+	summary.ExpiryMs = state.ExpiryMs
 	notifyBestEffort(notifier, "market_state", fmt.Sprintf("symbol=%s state=%s confidence=%d", symbol, state.State, state.ConfidenceScore))
 
-	comp := strategycore.NewCompiler(envInt("STRATEGY_MIN_CONFIDENCE_PAPER", 70))
-	intent, err := comp.Compile(strategycore.CompileInput{
-		SignalID:      fmt.Sprintf("e2e-%d", time.Now().UnixMilli()),
-		CanonicalPair: symbol,
-		SetupName:     "VWAP_HYBRID_CONFLUENCE",
-		State:         state,
-		NotionalUSD:   notionalUSD,
-		Delta:         snap.Delta,
-	})
-	if err != nil {
-		fmt.Printf("ACTION strategy_reject err=%v\n", err)
-		notifyBestEffort(notifier, "strategy_reject", fmt.Sprintf("symbol=%s err=%v", symbol, err))
-		return router.Intent{}, nil, err
-	}
-	fmt.Printf("PAPER signal id=%s setup=%s side=%s pair=%s notional=%.4f\n",
-		intent.SignalID, intent.Setup, colorSide(string(intent.Side)), intent.CanonicalPair, intent.NotionalUSD)
-	notifyBestEffort(notifier, "strategy_intent", fmt.Sprintf("signal_id=%s side=%s pair=%s notional=%.4f", intent.SignalID, intent.Side, intent.CanonicalPair, intent.NotionalUSD))
-
+	comp := strategycore.NewCompiler(envInt("STRATEGY_MIN_CONFIDENCE_PAPER", 90))
 	cfg := loadRouterConfigFromEnv()
 	statuses := collectVenueStatusForPaper()
-	plan := router.BuildPlan(intent, statuses, cfg)
-	if !plan.Accepted {
-		fmt.Printf("ACTION route_reject reason=%s detail=%s\n", plan.Reason, plan.ReasonText)
-		notifyBestEffort(notifier, "router_reject", fmt.Sprintf("reason=%s detail=%s", plan.Reason, plan.ReasonText))
-		for _, r := range plan.Rejected {
-			fmt.Printf("venue_reject venue=%s reason=%s detail=%s\n", r.Venue, r.Reason, r.Detail)
-		}
-		return intent, nil, fmt.Errorf("router rejected: %s", plan.Reason)
-	}
-
-	fmt.Printf("PAPER route allocations=%d\n", len(plan.Allocations))
-	notifyBestEffort(notifier, "router_plan", fmt.Sprintf("accepted allocations=%d", len(plan.Allocations)))
-	promoVenues := make([]string, 0, len(plan.Allocations))
-	for _, a := range plan.Allocations {
-		fmt.Printf("PAPER route_preview venue=%s weight=%.3f notional=%.4f\n", a.Venue, a.Weight, a.NotionalUSD)
-		promoVenues = append(promoVenues, string(a.Venue))
-	}
-
 	engine := replay.NewEngine(replay.FillModel{
 		SlippageBps: envFloat("PAPER_SLIPPAGE_BPS", 2.0),
 		FeeBps:      envFloat("PAPER_FEE_BPS", 3.5),
 		LatencyMs:   int64(envInt("PAPER_LATENCY_MS", 250)),
 	})
-	res := engine.ExecutePlan(plan)
-	fmt.Printf("PAPER exec accepted=%t total_notional=%.4f est_cost=%.4f\n", res.Accepted, res.TotalNotional, res.TotalNetCost)
-	notifyBestEffort(notifier, "paper_exec", fmt.Sprintf("accepted=%t total_notional=%.4f total_net_cost=%.4f", res.Accepted, res.TotalNotional, res.TotalNetCost))
-	_ = res
-	if err := paper.OnSignal(intent, liveVenue, snap.Price, time.Now().UTC()); err != nil {
-		fmt.Printf("ACTION entry_skip err=%v\n", err)
-	} else {
-		st := paper.State()
-		venue := liveVenue
-		if pos := st.Positions[strings.ToUpper(strings.TrimSpace(symbol))]; pos != nil && strings.TrimSpace(pos.Venue) != "" {
-			venue = pos.Venue
-		}
-		fmt.Printf("ACTION entry symbol=%s venue=%s side=%s px=%.2f open=%d balance=%.4f trades=%d\n", symbol, venue, colorSide(strings.ToLower(string(intent.Side))), snap.Price, len(st.Positions), st.BalanceUSD, len(st.Trades))
-		notifyBestEffort(notifier, "paper_entry", fmt.Sprintf("symbol=%s side=%s price=%.4f open_positions=%d balance=%.4f", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD))
+	independentVenues := envBool("PAPER_INDEPENDENT_VENUES", true)
+	maxSetupsToTrigger := maxInt(envInt("PAPER_MAX_SETUPS_PER_SYMBOL", 1), 1)
+	setups := paperSetupCatalog()
+	type acceptedCandidate struct {
+		intent router.Intent
+		plan   router.Plan
 	}
-	printPaperStatus(paper, symbol, snap.Price)
-	return intent, promoVenues, nil
+	accepted := make([]acceptedCandidate, 0, len(setups))
+	var (
+		firstIntent router.Intent
+		promoVenues []string
+		hadAccepted bool
+	)
+	for _, setup := range setups {
+		intent, err := comp.Compile(strategycore.CompileInput{
+			SignalID:      fmt.Sprintf("e2e-%d-%s", time.Now().UnixMilli(), setupSignalSuffix(setup)),
+			CanonicalPair: symbol,
+			SetupName:     setup,
+			State:         state,
+			NotionalUSD:   notionalUSD,
+			Delta:         snap.Delta,
+		})
+		if err != nil {
+			summary.StrategyRejects++
+			notifyBestEffort(notifier, "strategy_reject", fmt.Sprintf("symbol=%s setup=%s err=%v", symbol, setup, err))
+			continue
+		}
+		notifyBestEffort(notifier, "strategy_intent", fmt.Sprintf("signal_id=%s setup=%s side=%s pair=%s notional=%.4f", intent.SignalID, intent.Setup, intent.Side, intent.CanonicalPair, intent.NotionalUSD))
+
+		plan := router.BuildPlan(intent, statuses, cfg)
+		if !plan.Accepted {
+			summary.RouteRejects++
+			notifyBestEffort(notifier, "router_reject", fmt.Sprintf("setup=%s reason=%s detail=%s", intent.Setup, plan.Reason, plan.ReasonText))
+			continue
+		}
+		accepted = append(accepted, acceptedCandidate{
+			intent: intent,
+			plan:   plan,
+		})
+	}
+	if len(accepted) == 0 {
+		err := fmt.Errorf("no setup produced an accepted paper route")
+		summary.Errors = append(summary.Errors, err.Error())
+		summary.Paper = summarizePaperStatus(paper, symbol, snap.Price)
+		summary.TopSetups = runtimeDashboard.TopSetups(4)
+		summary.Watchlist = runtimeDashboard.TopWatchlist(5)
+		summary.HLWatchlist = runtimeDashboard.TopWatchlistByVenue("hyperliquid", 10)
+		summary.AsterWatchlist = runtimeDashboard.TopWatchlistByVenue("aster", 10)
+		summary.LighterWatchlist = runtimeDashboard.TopWatchlistByVenue("lighter", 10)
+		printCycleSummary(summary)
+		return router.Intent{}, nil, err
+	}
+	for i, candidate := range accepted {
+		if i >= maxSetupsToTrigger {
+			break
+		}
+		summary.AcceptedSetups = append(summary.AcceptedSetups, candidate.intent.Setup)
+		notifyBestEffort(notifier, "router_plan", fmt.Sprintf("setup=%s accepted allocations=%d mode=%s", candidate.intent.Setup, len(candidate.plan.Allocations), ternaryString(independentVenues, "independent_venues", "split_budget")))
+		currentPromoVenues := make([]string, 0, len(candidate.plan.Allocations))
+		for _, a := range candidate.plan.Allocations {
+			currentPromoVenues = append(currentPromoVenues, string(a.Venue))
+			venueNotional := a.NotionalUSD
+			if independentVenues {
+				venueNotional = notionalUSD
+			}
+			if venueNotional <= 0 {
+				continue
+			}
+			summary.RouteSplit[string(a.Venue)] += venueNotional
+			watchScore := watchlistScore(state, candidate.intent.Setup, snap, string(a.Venue))
+			runtimeDashboard.UpsertWatch(symbol, string(a.Venue), snap.Price, watchScore, watchlistGrade(watchScore), watchlistWhy(state, candidate.intent.Setup, snap, string(a.Venue)), now)
+			venuePlan := candidate.plan
+			venuePlan.Allocations = []router.Allocation{{
+				Venue:       a.Venue,
+				Weight:      1.0,
+				NotionalUSD: venueNotional,
+			}}
+			res := engine.ExecutePlan(venuePlan)
+			summary.EstCost += res.TotalNetCost
+			notifyBestEffort(notifier, "paper_exec", fmt.Sprintf("setup=%s venue=%s accepted=%t total_notional=%.4f total_net_cost=%.4f", candidate.intent.Setup, a.Venue, res.Accepted, res.TotalNotional, res.TotalNetCost))
+			opened, err := paper.OnSignal(candidate.intent, string(a.Venue), snap.Price, time.Now().UTC(), venueNotional, targetLev)
+			if err != nil {
+				summary.Errors = append(summary.Errors, fmt.Sprintf("%s@%s entry: %v", candidate.intent.Setup, a.Venue, err))
+				continue
+			}
+			if opened {
+				summary.Entries = append(summary.Entries, fmt.Sprintf("%s@%s", candidate.intent.Setup, a.Venue))
+				runtimeDashboard.NoteSetup(candidate.intent.Setup)
+				st := paper.State()
+				notifyBestEffort(notifier, "paper_entry", fmt.Sprintf("symbol=%s setup=%s venue=%s side=%s price=%.6f open_positions=%d balance=%.4f", symbol, candidate.intent.Setup, a.Venue, strings.ToLower(string(candidate.intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD))
+			}
+		}
+		if !hadAccepted {
+			firstIntent = candidate.intent
+			promoVenues = currentPromoVenues
+			hadAccepted = true
+		}
+	}
+	summary.Paper = summarizePaperStatus(paper, symbol, snap.Price)
+	summary.TopSetups = runtimeDashboard.TopSetups(4)
+	summary.Watchlist = runtimeDashboard.TopWatchlist(5)
+	summary.HLWatchlist = runtimeDashboard.TopWatchlistByVenue("hyperliquid", 10)
+	summary.AsterWatchlist = runtimeDashboard.TopWatchlistByVenue("aster", 10)
+	summary.LighterWatchlist = runtimeDashboard.TopWatchlistByVenue("lighter", 10)
+	printCycleSummary(summary)
+	return firstIntent, promoVenues, nil
 }
 
-func printPaperStatus(paper *replay.PaperTrader, symbol string, mark float64) {
+func summarizePaperStatus(paper *replay.PaperTrader, symbol string, mark float64) paperStatusSummary {
 	st := paper.State()
-	realized := st.BalanceUSD - envFloat("PAPER_START_BALANCE", 1000)
+	startPerVenue := envFloat("PAPER_START_BALANCE", 100)
+	start := startPerVenue * float64(maxInt(len(st.VenueBalances), 1))
+	realized := st.BalanceUSD - start
 	realizedPct := 0.0
-	start := envFloat("PAPER_START_BALANCE", 1000)
 	if start > 0 {
 		realizedPct = (realized / start) * 100.0
 	}
 	unreal := 0.0
-	unrealPct := 0.0
-	if p := st.Positions[strings.ToUpper(strings.TrimSpace(symbol))]; p != nil && mark > 0 {
-		unreal = (mark - p.EntryPrice) * p.Qty
-		if strings.EqualFold(p.Side, "sell") {
-			unreal = -unreal
-		}
-		unrealPct = pctOf(unreal, p.NotionalUSD)
-		fmt.Printf("ACTIVE_POSITION symbol=%s venue=%s side=%s entry=%.2f mark=%.2f notional=%.2f upnl=%s\n",
-			p.Symbol, p.Venue, colorSide(p.Side), p.EntryPrice, mark, p.NotionalUSD, colorPNL(unreal, unrealPct))
+	openPositions := paper.OpenPositions()
+	positions := make([]paperPositionView, 0, len(openPositions))
+	venueBalances := make(map[string]float64, len(st.VenueBalances))
+	for venue, bal := range st.VenueBalances {
+		venueBalances[venue] = bal
 	}
-	fmt.Printf("status open=%d realized=%s unrealized=%s balance=%.4f\n",
-		len(st.Positions),
-		colorPNL(realized, realizedPct),
-		colorPNL(unreal, unrealPct),
-		st.BalanceUSD,
-	)
+	for _, p := range openPositions {
+		if p == nil {
+			continue
+		}
+		current := st.LastMarks[strings.ToUpper(strings.TrimSpace(p.Symbol))]
+		if strings.EqualFold(strings.TrimSpace(p.Symbol), strings.ToUpper(strings.TrimSpace(symbol))) && mark > 0 {
+			current = mark
+		}
+		positionUnreal := 0.0
+		positionPct := 0.0
+		if current > 0 {
+			positionUnreal = (current - p.EntryPrice) * p.Qty
+			if strings.EqualFold(p.Side, "sell") {
+				positionUnreal = -positionUnreal
+			}
+			positionPct = pctOf(positionUnreal, p.NotionalUSD)
+		}
+		unreal += positionUnreal
+		positions = append(positions, paperPositionView{
+			Symbol:  p.Symbol,
+			Setup:   compactSetupLabel(p.Setup),
+			Venue:   p.Venue,
+			Side:    strings.ToUpper(strings.TrimSpace(p.Side)),
+			Entry:   formatPx(p.EntryPrice),
+			Current: formatPx(current),
+			Lev:     fmt.Sprintf("%dx", p.Leverage),
+			PnlPct:  fmt.Sprintf("%.2f%%", positionPct),
+			PnlUSD:  signedMoney(positionUnreal),
+		})
+	}
+	return paperStatusSummary{
+		OpenPositions: len(st.Positions),
+		Realized:      realized,
+		RealizedPct:   realizedPct,
+		Unrealized:    unreal,
+		UnrealizedPct: pctOf(unreal, start),
+		Balance:       st.BalanceUSD,
+		ClosedTrades:  len(st.Trades),
+		VenueBalances: venueBalances,
+		Positions:     positions,
+	}
+}
+
+type cycleSummary struct {
+	Timestamp        time.Time
+	Symbol           string
+	LiveVenue        string
+	SessionPrimary   string
+	SessionPhase     string
+	SessionTags      []string
+	IsUSOpen         bool
+	DayUTCOpen       time.Time
+	DayOpen          float64
+	Mark             float64
+	VWAP             float64
+	AVWAP            float64
+	State            string
+	Confidence       int
+	ExpiryMs         int64
+	AcceptedSetups   []string
+	Entries          []string
+	Exits            []string
+	RouteSplit       map[string]float64
+	StrategyRejects  int
+	RouteRejects     int
+	EstCost          float64
+	Errors           []string
+	Paper            paperStatusSummary
+	TopSetups        []string
+	Watchlist        []watchlistView
+	HLWatchlist      []watchlistView
+	AsterWatchlist   []watchlistView
+	LighterWatchlist []watchlistView
+}
+
+type paperStatusSummary struct {
+	OpenPositions int
+	Realized      float64
+	RealizedPct   float64
+	Unrealized    float64
+	UnrealizedPct float64
+	Balance       float64
+	ClosedTrades  int
+	VenueBalances map[string]float64
+	Positions     []paperPositionView
+}
+
+type paperPositionView struct {
+	Symbol  string
+	Setup   string
+	Venue   string
+	Side    string
+	Entry   string
+	Current string
+	Lev     string
+	PnlPct  string
+	PnlUSD  string
+}
+
+func printCycleSummary(s cycleSummary) {
+	lines := []string{
+		fmt.Sprintf("Cycle      %s", s.Timestamp.Format("15:04:05Z")),
+		fmt.Sprintf("Session    %-18s phase=%-8s us_open=%t", s.SessionPrimary, s.SessionPhase, s.IsUSOpen),
+		fmt.Sprintf("Market     symbol=%s  mode=PAPER||LIVE  venue=%s", s.Symbol, s.LiveVenue),
+		fmt.Sprintf("Account    open_utc=%s  day_open=%s  mark=%s", s.DayUTCOpen.Format("15:04"), formatPx(s.DayOpen), formatPx(s.Mark)),
+		fmt.Sprintf("Balances   %s", formatVenueBalances(s.Paper.VenueBalances)),
+		fmt.Sprintf("Fair Value vwap=%s  avwap=%s  state=%s  conf=%d", formatPx(s.VWAP), formatPx(s.AVWAP), s.State, s.Confidence),
+		fmt.Sprintf("Routing    setups=%d  entries=%d  exits=%d  rejects=%d/%d  cost=%s", len(s.AcceptedSetups), len(s.Entries), len(s.Exits), s.StrategyRejects, s.RouteRejects, formatMoney(s.EstCost)),
+		fmt.Sprintf("Split      %s", formatRouteSplit(s.RouteSplit)),
+		fmt.Sprintf("Paper      open=%d  trades=%d  bal=%s  real=%s  unrl=%s", s.Paper.OpenPositions, s.Paper.ClosedTrades, formatMoney(s.Paper.Balance), plainPNL(s.Paper.Realized, s.Paper.RealizedPct), plainPNL(s.Paper.Unrealized, s.Paper.UnrealizedPct)),
+	}
+	if len(s.AcceptedSetups) > 0 {
+		lines = append(lines, fmt.Sprintf("Used       %s", condenseListPretty(s.AcceptedSetups, 4)))
+	}
+	if len(s.Entries) > 0 {
+		lines = append(lines, fmt.Sprintf("Entries    %s", condenseListPretty(s.Entries, 4)))
+	}
+	if len(s.Exits) > 0 {
+		lines = append(lines, fmt.Sprintf("Exits      %s", condenseListPretty(s.Exits, 3)))
+	}
+	if len(s.Errors) > 0 {
+		lines = append(lines, fmt.Sprintf("Errors     %s", condenseList(s.Errors, 2)))
+	}
+	if len(s.SessionTags) > 0 {
+		lines = append(lines, fmt.Sprintf("Tags       %s", strings.Join(s.SessionTags, ", ")))
+	}
+	if len(s.TopSetups) > 0 {
+		lines = append(lines, fmt.Sprintf("Top Setups %s", strings.Join(s.TopSetups, "  |  ")))
+	}
+	printPanel("VWAP SCALPER PAPER || LIVE", lines)
+	if len(s.Paper.Positions) > 0 {
+		rows := make([][]string, 0, len(s.Paper.Positions))
+		for _, p := range s.Paper.Positions {
+			rows = append(rows, []string{p.Symbol, p.Setup, p.Venue, p.Side, p.Entry, p.Current, p.Lev, p.PnlPct, p.PnlUSD})
+		}
+		printTable("OPEN POSITIONS", []string{"symbol", "setup", "venue", "side", "entry", "current", "lev", "pnl %", "pnl $"}, rows)
+	}
+	if len(s.Watchlist) > 0 {
+		rows := make([][]string, 0, len(s.Watchlist))
+		for _, w := range s.Watchlist {
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, w.Venue, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+		}
+		printTable("WATCHLIST | GLOBAL BEST", []string{"rank", "symbol", "venue", "price", "score", "grade", "why"}, rows)
+	}
+	if len(s.HLWatchlist) > 0 {
+		rows := make([][]string, 0, len(s.HLWatchlist))
+		for _, w := range s.HLWatchlist {
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+		}
+		printTable("TOP 10 | HYPERLIQUID", []string{"rank", "symbol", "price", "score", "grade", "why"}, rows)
+	}
+	if len(s.AsterWatchlist) > 0 {
+		rows := make([][]string, 0, len(s.AsterWatchlist))
+		for _, w := range s.AsterWatchlist {
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+		}
+		printTable("TOP 10 | ASTER", []string{"rank", "symbol", "price", "score", "grade", "why"}, rows)
+	}
+	if len(s.LighterWatchlist) > 0 {
+		rows := make([][]string, 0, len(s.LighterWatchlist))
+		for _, w := range s.LighterWatchlist {
+			rows = append(rows, []string{fmt.Sprintf("%d", w.Rank), w.Symbol, formatPx(w.Price), fmt.Sprintf("%d", w.Score), w.Grade, w.Why})
+		}
+		printTable("TOP 10 | LIGHTER", []string{"rank", "symbol", "price", "score", "grade", "why"}, rows)
+	}
+}
+
+func printPanel(title string, lines []string) {
+	width := len(title) + 4
+	for _, line := range lines {
+		if len(line)+4 > width {
+			width = len(line) + 4
+		}
+	}
+	if width < 40 {
+		width = 40
+	}
+	fmt.Println()
+	fmt.Printf("┌─ %s %s┐\n", title, strings.Repeat("─", width-len(title)-5))
+	for _, line := range lines {
+		fmt.Printf("│ %-*s │\n", width-4, line)
+	}
+	fmt.Printf("└%s┘\n", strings.Repeat("─", width-2))
+}
+
+func printTable(title string, headers []string, rows [][]string) {
+	if len(headers) == 0 {
+		return
+	}
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = len(h)
+	}
+	for _, row := range rows {
+		for i := range headers {
+			if i < len(row) && len(row[i]) > widths[i] {
+				widths[i] = minInt(len(row[i]), 28)
+			}
+		}
+	}
+	fmt.Println()
+	fmt.Printf("┌─ %s %s┐\n", title, strings.Repeat("─", tableWidth(widths)-len(title)-3))
+	fmt.Println(renderTableBorder("├", "┬", "┤", widths))
+	fmt.Println(renderTableRow(headers, widths))
+	fmt.Println(renderTableBorder("├", "┼", "┤", widths))
+	for _, row := range rows {
+		fmt.Println(renderTableRow(limitRow(row, widths), widths))
+	}
+	fmt.Println(renderTableBorder("└", "┴", "┘", widths))
+}
+
+func renderTableBorder(left, mid, right string, widths []int) string {
+	parts := make([]string, 0, len(widths))
+	for _, w := range widths {
+		parts = append(parts, strings.Repeat("─", w+2))
+	}
+	return left + strings.Join(parts, mid) + right
+}
+
+func renderTableRow(cols []string, widths []int) string {
+	out := make([]string, 0, len(widths))
+	for i, w := range widths {
+		val := ""
+		if i < len(cols) {
+			val = cols[i]
+		}
+		out = append(out, " "+padOrTrim(val, w)+" ")
+	}
+	return "│" + strings.Join(out, "│") + "│"
+}
+
+func limitRow(row []string, widths []int) []string {
+	out := make([]string, len(widths))
+	for i := range widths {
+		if i < len(row) {
+			out[i] = row[i]
+		}
+	}
+	return out
+}
+
+func tableWidth(widths []int) int {
+	total := 1
+	for _, w := range widths {
+		total += w + 3
+	}
+	return total
+}
+
+func padOrTrim(s string, width int) string {
+	if len(s) <= width {
+		return fmt.Sprintf("%-*s", width, s)
+	}
+	if width <= 1 {
+		return s[:width]
+	}
+	return s[:width-1] + "…"
+}
+
+func compactSetupLabel(setup string) string {
+	s := strings.TrimSpace(setup)
+	s = strings.TrimPrefix(s, "VWAP_")
+	s = strings.TrimPrefix(s, "ANCHORED_")
+	s = strings.ReplaceAll(s, "_", " ")
+	return strings.ToLower(s)
+}
+
+func condenseListPretty(items []string, max int) string {
+	pretty := make([]string, 0, len(items))
+	for _, item := range items {
+		pretty = append(pretty, compactSetupLabel(item))
+	}
+	return condenseList(pretty, max)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func ternaryString(cond bool, yes, no string) string {
+	if cond {
+		return yes
+	}
+	return no
+}
+
+type runtimeDashboardState struct {
+	setupStats map[string]*setupPerf
+	watchlist  map[string]watchlistView
+}
+
+type setupPerf struct {
+	Entries int
+	PnlUSD  float64
+}
+
+type watchlistView struct {
+	Rank   int
+	Symbol string
+	Venue  string
+	Price  float64
+	Score  int
+	Grade  string
+	Why    string
+	SeenAt time.Time
+}
+
+var runtimeDashboard = newRuntimeDashboardState()
+
+func newRuntimeDashboardState() *runtimeDashboardState {
+	return &runtimeDashboardState{
+		setupStats: map[string]*setupPerf{},
+		watchlist:  map[string]watchlistView{},
+	}
+}
+
+func (d *runtimeDashboardState) NoteSetup(setup string) {
+	key := compactSetupLabel(setup)
+	stat := d.setupStats[key]
+	if stat == nil {
+		stat = &setupPerf{}
+		d.setupStats[key] = stat
+	}
+	stat.Entries++
+}
+
+func (d *runtimeDashboardState) NoteExit(tr replay.PaperTrade) {
+	key := compactSetupLabel(tr.Setup)
+	stat := d.setupStats[key]
+	if stat == nil {
+		stat = &setupPerf{}
+		d.setupStats[key] = stat
+	}
+	stat.PnlUSD += tr.PnlUSD
+}
+
+func (d *runtimeDashboardState) UpsertWatch(symbol, venue string, price float64, score int, grade, why string, seenAt time.Time) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	if symbol == "" {
+		return
+	}
+	key := symbol
+	if venue != "" {
+		key = symbol + "@" + venue
+	}
+	d.watchlist[key] = watchlistView{
+		Symbol: symbol,
+		Venue:  venue,
+		Price:  price,
+		Score:  score,
+		Grade:  grade,
+		Why:    why,
+		SeenAt: seenAt,
+	}
+}
+
+func (d *runtimeDashboardState) TopSetups(limit int) []string {
+	type row struct {
+		name string
+		stat *setupPerf
+	}
+	rows := make([]row, 0, len(d.setupStats))
+	for name, stat := range d.setupStats {
+		rows = append(rows, row{name: name, stat: stat})
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].stat.PnlUSD == rows[j].stat.PnlUSD {
+			return rows[i].stat.Entries > rows[j].stat.Entries
+		}
+		return rows[i].stat.PnlUSD > rows[j].stat.PnlUSD
+	})
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, fmt.Sprintf("%s e:%d pnl:%s", r.name, r.stat.Entries, signedMoney(r.stat.PnlUSD)))
+	}
+	return out
+}
+
+func (d *runtimeDashboardState) TopWatchlist(limit int) []watchlistView {
+	return d.topWatchlistFiltered("", limit)
+}
+
+func (d *runtimeDashboardState) TopWatchlistByVenue(venue string, limit int) []watchlistView {
+	return d.topWatchlistFiltered(venue, limit)
+}
+
+func (d *runtimeDashboardState) topWatchlistFiltered(venue string, limit int) []watchlistView {
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	rows := make([]watchlistView, 0, len(d.watchlist))
+	for _, row := range d.watchlist {
+		if venue != "" && !strings.EqualFold(row.Venue, venue) {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].Score == rows[j].Score {
+			if rows[i].Grade == rows[j].Grade {
+				if rows[i].Venue == rows[j].Venue {
+					return rows[i].SeenAt.After(rows[j].SeenAt)
+				}
+				return rows[i].Venue < rows[j].Venue
+			}
+			return rows[i].Grade < rows[j].Grade
+		}
+		return rows[i].Score > rows[j].Score
+	})
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	for i := range rows {
+		rows[i].Rank = i + 1
+	}
+	return rows
+}
+
+func formatVenueBalances(balances map[string]float64) string {
+	if len(balances) == 0 {
+		return "none"
+	}
+	order := []string{"hyperliquid", "aster", "lighter"}
+	parts := make([]string, 0, len(order))
+	for _, venue := range order {
+		if bal, ok := balances[venue]; ok {
+			label := venue
+			switch venue {
+			case "hyperliquid":
+				label = "hl"
+			case "aster":
+				label = "aster"
+			case "lighter":
+				label = "lighter"
+			}
+			parts = append(parts, fmt.Sprintf("%s=%s", label, formatMoney(bal)))
+		}
+	}
+	return strings.Join(parts, "  ")
+}
+
+func signedMoney(v float64) string {
+	if v > 0 {
+		return "+" + formatMoney(v)
+	}
+	return formatMoney(v)
+}
+
+func watchlistGrade(score int) string {
+	switch {
+	case score >= 95:
+		return "A+"
+	case score >= 90:
+		return "A"
+	case score >= 85:
+		return "A-"
+	case score >= 80:
+		return "B"
+	case score >= 70:
+		return "C"
+	case score >= 60:
+		return "D"
+	default:
+		return "F"
+	}
+}
+
+func watchlistScore(state models.StateSignal, setup string, snap marketstate.Snapshot, venue string) int {
+	score := state.ConfidenceScore
+
+	switch state.State {
+	case models.StateCompression:
+		score += 8
+	case models.StateExpansion:
+		score -= 6
+	case models.StateChop:
+		score -= 12
+	}
+
+	switch snap.SessionContext.PrimarySession {
+	case "US_OPEN":
+		score += 8
+	case "LONDON_US_OVERLAP":
+		score += 6
+	case "LONDON":
+		score += 4
+	case "ASIA":
+		score += 2
+	case "OFF_HOURS":
+		score -= 15
+	}
+
+	if snap.SessionContext.IsUSOpen {
+		score += 3
+	}
+	if snap.HTFAligned {
+		score += 4
+	}
+	if snap.ProfileReady {
+		score += 3
+	}
+	if snap.TapeReady {
+		score += 3
+	}
+	if snap.VolumeRatio >= 1.25 {
+		score += 5
+	} else if snap.VolumeRatio < 0.9 {
+		score -= 4
+	}
+	if snap.ATRRatio >= 0.4 && snap.ATRRatio <= 1.2 {
+		score += 3
+	}
+	if math.Abs(snap.DeltaFlipStrength) >= 0.35 {
+		score += 4
+	}
+	if snap.DayOpenPrice > 0 && snap.Price > 0 {
+		dayMoveBps := math.Abs((snap.Price-snap.DayOpenPrice)/snap.DayOpenPrice) * 10000.0
+		if dayMoveBps <= 120 {
+			score += 2
+		} else if dayMoveBps >= 400 {
+			score -= 5
+		}
+	}
+
+	switch strings.ToUpper(strings.TrimSpace(setup)) {
+	case "VWAP_HYBRID_CONFLUENCE":
+		score += 8
+	case "VWAP_OPENING_DRIVE", "VWAP_BREAKOUT_CONTINUATION":
+		if snap.SessionContext.IsUSOpen || snap.SessionContext.PrimarySession == "LONDON_US_OVERLAP" {
+			score += 6
+		} else {
+			score -= 2
+		}
+	case "VWAP_REJECTION_CONTINUATION", "VWAP_PULLBACK_IN_TREND", "VWAP_EMA_TREND_FUSION":
+		score += 4
+	case "ANCHORED_VWAP_REVERSION", "VWAP_DEVIATION_BAND_REVERSION", "VWAP_DOUBLE_TAP_REVERSAL":
+		score += 2
+	}
+
+	switch strings.ToLower(strings.TrimSpace(venue)) {
+	case "hyperliquid":
+		score += 3
+	case "aster":
+		score += 2
+	case "lighter":
+		score += 1
+	}
+	score += int(math.Round(venueScore(strings.ToLower(strings.TrimSpace(venue))) * 2))
+
+	if score > 99 {
+		score = 99
+	}
+	if score < 0 {
+		score = 0
+	}
+	return score
+}
+
+func watchlistWhy(state models.StateSignal, setup string, snap marketstate.Snapshot, venue string) string {
+	reasons := make([]string, 0, 4)
+	reasons = append(reasons, compactSetupLabel(setup))
+	reasons = append(reasons, strings.ToLower(string(state.State)))
+	reasons = append(reasons, strings.ToLower(snap.SessionContext.PrimarySession))
+	if snap.SessionContext.IsUSOpen {
+		reasons = append(reasons, "us-open")
+	}
+	if snap.VolumeRatio >= 1.25 {
+		reasons = append(reasons, "volume+")
+	}
+	if math.Abs(snap.DeltaFlipStrength) >= 0.35 {
+		reasons = append(reasons, "delta-flip")
+	}
+	if snap.HTFAligned && snap.ProfileReady && snap.TapeReady {
+		reasons = append(reasons, "toolstack-ready")
+	}
+	if strings.TrimSpace(venue) != "" {
+		reasons = append(reasons, strings.ToLower(strings.TrimSpace(venue)))
+	}
+	return strings.Join(reasons, " ")
+}
+
+func formatPx(v float64) string {
+	switch {
+	case v >= 1000:
+		return fmt.Sprintf("%.2f", v)
+	case v >= 1:
+		return fmt.Sprintf("%.4f", v)
+	case v > 0:
+		return fmt.Sprintf("%.6f", v)
+	default:
+		return "n/a"
+	}
+}
+
+func formatMoney(v float64) string {
+	return fmt.Sprintf("%.4f", v)
+}
+
+func plainPNL(pnl, pct float64) string {
+	sign := ""
+	if pnl > 0 {
+		sign = "+"
+	}
+	return fmt.Sprintf("%s%.4f (%.2f%%)", sign, pnl, pct)
+}
+
+func formatRouteSplit(split map[string]float64) string {
+	if len(split) == 0 {
+		return "none"
+	}
+	keys := make([]string, 0, len(split))
+	for k := range split {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%s", k, formatMoney(split[k])))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func condenseList(items []string, max int) string {
+	if len(items) == 0 {
+		return "none"
+	}
+	if len(items) <= max {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:max], ", ") + fmt.Sprintf(" +%d more", len(items)-max)
+}
+
+func paperSetupCatalog() []string {
+	return []string{
+		"VWAP_DEVIATION_BAND_REVERSION",
+		"VWAP_RECLAIM_AND_HOLD",
+		"VWAP_REJECTION_CONTINUATION",
+		"VWAP_LIQUIDITY_POCKET_EXPANSION",
+		"VWAP_BREAKOUT_CONTINUATION",
+		"ANCHORED_VWAP_REVERSION",
+		"VWAP_RSI_DIVERGENCE_FADE",
+		"VWAP_PULLBACK_IN_TREND",
+		"VWAP_LIQUIDITY_HUNT_REVERSAL",
+		"VWAP_VOLUME_PROFILE_CONFLUENCE",
+		"VWAP_EMA_TREND_FUSION",
+		"VWAP_RANGE_COMPRESSION_BREAKOUT",
+		"VWAP_OPENING_DRIVE",
+		"VWAP_NEWS_REACTION",
+		"VWAP_DOUBLE_TAP_REVERSAL",
+		"VWAP_MULTI_SESSION_EQUILIBRIUM",
+		"VWAP_ORDER_FLOW_ABSORPTION",
+		"VWAP_HYBRID_CONFLUENCE",
+	}
+}
+
+func setupSignalSuffix(setup string) string {
+	s := strings.ToLower(strings.TrimSpace(setup))
+	s = strings.ReplaceAll(s, "vwap_", "")
+	s = strings.ReplaceAll(s, "anchored_", "a_")
+	s = strings.ReplaceAll(s, "_", "-")
+	if len(s) > 24 {
+		s = s[:24]
+	}
+	if s == "" {
+		return "setup"
+	}
+	return s
 }
 
 func resolveSymbols(rawSymbols, fallback string) []string {

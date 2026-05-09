@@ -4,12 +4,16 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/SpaceCadetOG/VWAP-Scalper/internal/models"
 )
 
 // Snapshot is a compact normalized market input for regime detection.
 type Snapshot struct {
+	DayUTCOpen        time.Time
+	DayOpenPrice      float64
+	SessionContext    SessionContext
 	Price             float64
 	SessionVWAP       float64
 	AnchoredVWAP      float64
