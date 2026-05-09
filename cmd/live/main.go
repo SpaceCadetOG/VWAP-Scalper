@@ -41,6 +41,7 @@ func main() {
 	paperRoute := flag.Bool("paper-route", false, "run Step 9 paper/replay routing simulation (no live orders)")
 	paperE2E := flag.Bool("paper-e2e", false, "run strategycore+marketstate+router+paper end-to-end simulation")
 	paperDaemon := flag.Bool("paper-daemon", false, "run continuous paper e2e loop (for separate tab/window)")
+	start := flag.Bool("start", false, "simple start mode (uses env only)")
 	testTrade := flag.Bool("test-trade", false, "place a small live test trade and collect order/fill details")
 	testOrderTypes := flag.Bool("test-order-types", false, "place/cancel small Aster order-type smoke tests")
 	testBatch := flag.Bool("test-batch", false, "run live batch-order smoke tests")
@@ -49,6 +50,12 @@ func main() {
 	symbols := flag.String("symbols", "", "comma-separated symbols for --paper-daemon (overrides --symbol)")
 	notionalUSD := flag.Float64("notional-usd", 5.0, "target notional USD for --test-trade")
 	flag.Parse()
+
+	if *start {
+		syms := resolveSymbols(envString("BOT_SYMBOLS", "BTCUSDT"), "BTCUSDT")
+		runPaperDaemon(syms, envFloat("BOT_NOTIONAL_USD", 10))
+		return
+	}
 
 	if *testBatch {
 		runBatchSmoke(strings.ToLower(strings.TrimSpace(*venue)), strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
@@ -165,8 +172,13 @@ func runPaperDaemon(symbols []string, notionalUSD float64) {
 	if intervalSec < 5 {
 		intervalSec = 5
 	}
-	fmt.Printf("live_lite_start symbols=%s notional=%.4f interval_sec=%d mode=paper\n", strings.Join(symbols, ","), notionalUSD, intervalSec)
+	liveVenue := strings.ToLower(strings.TrimSpace(envString("PAPER_PROMOTE_LIVE_VENUE", "hyperliquid")))
+	fmt.Printf("live_lite_start symbols=%s notional=%.4f interval_sec=%d mode=paper live_venue=%s\n", strings.Join(symbols, ","), notionalUSD, intervalSec, liveVenue)
 	fmt.Println("live_lite_controls promote_next_live='y' + Enter")
+	autoPromote := envBool("PAPER_AUTO_PROMOTE_LIVE", false)
+	if autoPromote {
+		fmt.Println("live_lite_controls auto_promote_live=true")
+	}
 	var promoteRequested int32
 	go func() {
 		sc := bufio.NewScanner(os.Stdin)
@@ -184,12 +196,12 @@ func runPaperDaemon(symbols []string, notionalUSD float64) {
 		for _, symbol := range symbols {
 			intent, err := runPaperE2EOnce(symbol, notionalUSD)
 			if err != nil {
-				fmt.Printf("cycle_error symbol=%s err=%v\n", symbol, err)
+				fmt.Printf("cycle_error symbol=%s live_venue=%s err=%v\n", symbol, liveVenue, err)
 				continue
 			}
-			if atomic.LoadInt32(&promoteRequested) == 1 {
+			if autoPromote || atomic.LoadInt32(&promoteRequested) == 1 {
 				atomic.StoreInt32(&promoteRequested, 0)
-				fmt.Printf("promote_live signal_id=%s side=%s pair=%s\n", intent.SignalID, intent.Side, intent.CanonicalPair)
+				fmt.Printf("promote_live signal_id=%s side=%s pair=%s live_venue=%s\n", intent.SignalID, intent.Side, intent.CanonicalPair, liveVenue)
 				runLivePromotion(intent, symbol)
 			}
 		}
@@ -199,7 +211,8 @@ func runPaperDaemon(symbols []string, notionalUSD float64) {
 
 func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) {
 	now := time.Now().UTC()
-	fmt.Printf("cycle ts=%s symbol=%s\n", now.Format(time.RFC3339), symbol)
+	liveVenue := strings.ToLower(strings.TrimSpace(envString("PAPER_PROMOTE_LIVE_VENUE", "hyperliquid")))
+	fmt.Printf("cycle ts=%s symbol=%s live_venue=%s\n", now.Format(time.RFC3339), symbol, liveVenue)
 	notifier := observability.NewNotifierFromEnv()
 	if !envBool("SIM_USE_LIVE_SNAPSHOT", true) {
 		return router.Intent{}, fmt.Errorf("SIM_USE_LIVE_SNAPSHOT must be true (no placeholder mode)")
