@@ -46,6 +46,7 @@ func main() {
 	testBatch := flag.Bool("test-batch", false, "run live batch-order smoke tests")
 	venue := flag.String("venue", "all", "venue to check (all|aster|hyperliquid|lighter|coinbase)")
 	symbol := flag.String("symbol", "ETHUSDT", "trade symbol for --test-trade")
+	symbols := flag.String("symbols", "", "comma-separated symbols for --paper-daemon (overrides --symbol)")
 	notionalUSD := flag.Float64("notional-usd", 5.0, "target notional USD for --test-trade")
 	flag.Parse()
 
@@ -72,7 +73,7 @@ func main() {
 		return
 	}
 	if *paperDaemon {
-		runPaperDaemon(strings.ToUpper(strings.TrimSpace(*symbol)), *notionalUSD)
+		runPaperDaemon(resolveSymbols(*symbols, *symbol), *notionalUSD)
 		return
 	}
 
@@ -159,12 +160,12 @@ func runPaperE2E(symbol string, notionalUSD float64) {
 	}
 }
 
-func runPaperDaemon(symbol string, notionalUSD float64) {
+func runPaperDaemon(symbols []string, notionalUSD float64) {
 	intervalSec := envInt("PAPER_DAEMON_INTERVAL_SEC", 30)
 	if intervalSec < 5 {
 		intervalSec = 5
 	}
-	fmt.Printf("live_lite_start symbol=%s notional=%.4f interval_sec=%d mode=paper\n", symbol, notionalUSD, intervalSec)
+	fmt.Printf("live_lite_start symbols=%s notional=%.4f interval_sec=%d mode=paper\n", strings.Join(symbols, ","), notionalUSD, intervalSec)
 	fmt.Println("live_lite_controls promote_next_live='y' + Enter")
 	var promoteRequested int32
 	go func() {
@@ -180,13 +181,17 @@ func runPaperDaemon(symbol string, notionalUSD float64) {
 	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer ticker.Stop()
 	for {
-		intent, err := runPaperE2EOnce(symbol, notionalUSD)
-		if err != nil {
-			fmt.Printf("cycle_error err=%v\n", err)
-		} else if atomic.LoadInt32(&promoteRequested) == 1 {
-			atomic.StoreInt32(&promoteRequested, 0)
-			fmt.Printf("promote_live signal_id=%s side=%s pair=%s\n", intent.SignalID, intent.Side, intent.CanonicalPair)
-			runLivePromotion(intent, symbol)
+		for _, symbol := range symbols {
+			intent, err := runPaperE2EOnce(symbol, notionalUSD)
+			if err != nil {
+				fmt.Printf("cycle_error symbol=%s err=%v\n", symbol, err)
+				continue
+			}
+			if atomic.LoadInt32(&promoteRequested) == 1 {
+				atomic.StoreInt32(&promoteRequested, 0)
+				fmt.Printf("promote_live signal_id=%s side=%s pair=%s\n", intent.SignalID, intent.Side, intent.CanonicalPair)
+				runLivePromotion(intent, symbol)
+			}
 		}
 		<-ticker.C
 	}
@@ -222,7 +227,12 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		MaxHoldSeconds: envInt("PAPER_MAX_HOLD_SEC", 180),
 	})
 	if tr := paper.Mark(symbol, snap.Price, time.Now().UTC()); tr != nil {
-		fmt.Printf("exit symbol=%s side=%s reason=%s pnl=%.4f balance=%.4f\n", tr.Symbol, tr.Side, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD)
+		pct := 0.0
+		if tr.NotionalUSD > 0 {
+			pct = (tr.PnlUSD / tr.NotionalUSD) * 100.0
+		}
+		fmt.Printf("exit symbol=%s side=%s reason=%s pnl=%s balance=%.4f\n",
+			tr.Symbol, colorSide(tr.Side), tr.Reason, colorPNL(tr.PnlUSD, pct), paper.State().BalanceUSD)
 		notifyBestEffort(notifier, "paper_exit", fmt.Sprintf("symbol=%s reason=%s pnl=%.4f balance=%.4f", tr.Symbol, tr.Reason, tr.PnlUSD, paper.State().BalanceUSD))
 	}
 
@@ -246,7 +256,7 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		return router.Intent{}, err
 	}
 	fmt.Printf("signal id=%s setup=%s side=%s pair=%s notional=%.4f\n",
-		intent.SignalID, intent.Setup, intent.Side, intent.CanonicalPair, intent.NotionalUSD)
+		intent.SignalID, intent.Setup, colorSide(string(intent.Side)), intent.CanonicalPair, intent.NotionalUSD)
 	notifyBestEffort(notifier, "strategy_intent", fmt.Sprintf("signal_id=%s side=%s pair=%s notional=%.4f", intent.SignalID, intent.Side, intent.CanonicalPair, intent.NotionalUSD))
 
 	cfg := loadRouterConfigFromEnv()
@@ -280,10 +290,89 @@ func runPaperE2EOnce(symbol string, notionalUSD float64) (router.Intent, error) 
 		fmt.Printf("entry skip=%v\n", err)
 	} else {
 		st := paper.State()
-		fmt.Printf("entry symbol=%s side=%s px=%.2f open=%d balance=%.4f trades=%d\n", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD, len(st.Trades))
+		fmt.Printf("entry symbol=%s side=%s px=%.2f open=%d balance=%.4f trades=%d\n", symbol, colorSide(strings.ToLower(string(intent.Side))), snap.Price, len(st.Positions), st.BalanceUSD, len(st.Trades))
 		notifyBestEffort(notifier, "paper_entry", fmt.Sprintf("symbol=%s side=%s price=%.4f open_positions=%d balance=%.4f", symbol, strings.ToLower(string(intent.Side)), snap.Price, len(st.Positions), st.BalanceUSD))
 	}
+	printPaperStatus(paper, symbol, snap.Price)
 	return intent, nil
+}
+
+func printPaperStatus(paper *replay.PaperTrader, symbol string, mark float64) {
+	st := paper.State()
+	realized := st.BalanceUSD - envFloat("PAPER_START_BALANCE", 1000)
+	realizedPct := 0.0
+	start := envFloat("PAPER_START_BALANCE", 1000)
+	if start > 0 {
+		realizedPct = (realized / start) * 100.0
+	}
+	unreal := 0.0
+	unrealPct := 0.0
+	if p := st.Positions[strings.ToUpper(strings.TrimSpace(symbol))]; p != nil && mark > 0 {
+		unreal = (mark - p.EntryPrice) * p.Qty
+		if strings.EqualFold(p.Side, "sell") {
+			unreal = -unreal
+		}
+		unrealPct = pctOf(unreal, p.NotionalUSD)
+	}
+	fmt.Printf("status open=%d realized=%s unrealized=%s balance=%.4f\n",
+		len(st.Positions),
+		colorPNL(realized, realizedPct),
+		colorPNL(unreal, unrealPct),
+		st.BalanceUSD,
+	)
+}
+
+func resolveSymbols(rawSymbols, fallback string) []string {
+	if strings.TrimSpace(rawSymbols) == "" {
+		return []string{strings.ToUpper(strings.TrimSpace(fallback))}
+	}
+	parts := strings.Split(rawSymbols, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, p := range parts {
+		s := strings.ToUpper(strings.TrimSpace(p))
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return []string{strings.ToUpper(strings.TrimSpace(fallback))}
+	}
+	return out
+}
+
+func pctOf(v, base float64) float64 {
+	if base == 0 {
+		return 0
+	}
+	return (v / base) * 100.0
+}
+
+func colorSide(side string) string {
+	s := strings.ToLower(strings.TrimSpace(side))
+	if s == "buy" || s == "long" {
+		return "\033[32m" + side + "\033[0m"
+	}
+	if s == "sell" || s == "short" {
+		return "\033[31m" + side + "\033[0m"
+	}
+	return side
+}
+
+func colorPNL(pnl, pct float64) string {
+	val := fmt.Sprintf("%.4f (%.2f%%)", pnl, pct)
+	if pnl > 0 {
+		return "\033[32m+" + val + "\033[0m"
+	}
+	if pnl < 0 {
+		return "\033[31m" + val + "\033[0m"
+	}
+	return val
 }
 
 func runLivePromotion(intent router.Intent, symbol string) {
